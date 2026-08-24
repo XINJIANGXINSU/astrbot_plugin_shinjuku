@@ -552,7 +552,12 @@ class ShinjukuService:
                         gift_error = exc.message
                 return {"user": user, "created": True, "gift": gift, "gift_error": gift_error}
 
-    async def login(self, uid: str, entry_type: str = "normal") -> dict[str, Any]:
+    async def login(
+        self,
+        uid: str,
+        entry_type: str = "normal",
+        generate_checkcode: bool = True,
+    ) -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction():
                 user = await self.find_user(uid, conn)
@@ -567,7 +572,7 @@ class ShinjukuService:
                         f"当前欠费 {_money_text(debt)} {self.currency}，请先充值后再入场。",
                         "INSUFFICIENT_BALANCE_FOR_LOGIN",
                     )
-                if self.self_open_door_enabled:
+                if self.self_open_door_enabled and generate_checkcode:
                     checkcode = await self._generate_checkcode(conn)
                 else:
                     checkcode = None
