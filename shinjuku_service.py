@@ -1522,7 +1522,7 @@ class ShinjukuService:
                 "rateBps": rate_bps,
                 "priority": 50,
                 "stackable": False,
-                "consume": False,
+                "consume": True,
                 "condition": {},
             },
         )
