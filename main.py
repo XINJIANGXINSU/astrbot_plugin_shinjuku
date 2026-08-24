@@ -334,7 +334,7 @@ def _format_players(users: list[dict[str, Any]], nicknames: dict[str, str] | Non
     return "\n".join(lines)
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.2.0")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.2.1")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -353,8 +353,13 @@ class ShinjukuPlugin(Star):
         self_open_door_enabled = bool(config.get("self_open_door_enabled") is not False)
         login_grace_minutes = int(config.get("login_grace_minutes") or 3)
         sneak_login_enabled = bool(config.get("sneak_login_enabled") is True)
+        try:
+            sneak_login_points_threshold = int(config.get("sneak_login_points_threshold", 10))
+        except (TypeError, ValueError):
+            sneak_login_points_threshold = 10
         self.self_open_door_enabled = self_open_door_enabled
         self.sneak_login_enabled = sneak_login_enabled
+        self.sneak_login_points_threshold = max(0, sneak_login_points_threshold)
         self.service = ShinjukuService(
             db_path, self.currency, config.get("billing", {}) or {}, points_per_amount, max_active_checkcodes,
             self_open_door_enabled, login_grace_minutes,
@@ -699,7 +704,8 @@ class ShinjukuPlugin(Star):
 
     @filter.command("偷偷上机")
     async def sneak_login_cmd(self, event: AstrMessageEvent):
-        """偷偷上机：仅已注册用户可偷偷上机（未注册用户回复「用户未注册」，不自动注册），
+        """偷偷上机：仅已注册且积分高于配置门槛的用户可偷偷上机，
+        未注册用户回复「用户未注册」，积分不足时禁止入场；
         计费流程与 /login 一致，但会话标记为「偷偷上机」；
         处理完成后通过 OneBot API 撤回玩家发送的指令消息。
         功能开关 sneak_login_enabled 关闭时不响应（与未修改版本行为一致）。"""
@@ -714,6 +720,13 @@ class ShinjukuPlugin(Star):
             uid = self._target_from_optional_arg(event)
             if not await self.service.find_user(uid):
                 return "用户未注册"
+            wallet = await self.service.wallet(uid)
+            points = float(wallet["points"]["available"] or 0)
+            if points <= self.sneak_login_points_threshold:
+                return (
+                    f"（积分需高于 {self.sneak_login_points_threshold}）"
+                    "条件不满足，禁止偷偷上机"
+                )
             login_result = await self.service.login(uid, "sneak")
             session = login_result["session"]
             over_capacity = bool(login_result.get("overCapacity"))
