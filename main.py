@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .nickname_cache import NicknameCache
 from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents, cents_to_text
 
 
@@ -336,7 +337,7 @@ def _format_players(users: list[dict[str, Any]], nicknames: dict[str, str] | Non
     return "\n".join(lines)
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.0")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.1")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -371,7 +372,7 @@ class ShinjukuPlugin(Star):
             db_path, self.currency, config.get("billing", {}) or {}, points_per_amount, max_active_checkcodes,
             self_open_door_enabled, login_grace_minutes,
         )
-        self.nicknames: dict[str, str] = {}
+        self.nicknames = NicknameCache()
 
     async def terminate(self):
         await self.service.close()
@@ -422,8 +423,22 @@ class ShinjukuPlugin(Star):
     def _sender_uid(self, event: AstrMessageEvent) -> str:
         return f"QQ:{self._sender_real_qq(event)}"
 
+    def _nickname_scope(self, event: AstrMessageEvent) -> str:
+        try:
+            platform = str(event.get_platform_name() or "unknown")
+        except Exception:
+            platform = str(getattr(getattr(event, "platform_meta", None), "name", "") or "unknown")
+        try:
+            group_id = event.get_group_id()
+        except Exception:
+            group_id = None
+        if group_id is not None and str(group_id):
+            return f"{platform}:group:{group_id}"
+        return f"{platform}:private:{self._sender_real_qq(event)}"
+
     def _remember_sender_name(self, event: AstrMessageEvent) -> None:
         qq = self._sender_real_qq(event)
+        scope = self._nickname_scope(event)
         for name in ("get_sender_name", "get_sender_nickname", "get_sender_display_name"):
             method = getattr(event, name, None)
             if callable(method):
@@ -432,7 +447,7 @@ class ShinjukuPlugin(Star):
                 except Exception:
                     value = None
                 if value:
-                    self.nicknames[qq] = str(value)
+                    self.nicknames.set(scope, qq, str(value))
                     return
         for holder_name in ("sender", "message_obj"):
             holder = getattr(event, holder_name, None)
@@ -441,7 +456,7 @@ class ShinjukuPlugin(Star):
             for attr in ("nickname", "nick", "name", "card", "display_name"):
                 value = getattr(holder, attr, None)
                 if value:
-                    self.nicknames[qq] = str(value)
+                    self.nicknames.set(scope, qq, str(value))
                     return
 
     def _admins(self) -> set[str]:
@@ -494,6 +509,7 @@ class ShinjukuPlugin(Star):
 
     def _at_label(self, event: AstrMessageEvent, uid: str) -> str:
         qq = uid.split(":", 1)[1] if uid.startswith("QQ:") else uid
+        scope = self._nickname_scope(event)
         try:
             components = event.get_messages()
         except Exception:
@@ -513,9 +529,9 @@ class ShinjukuPlugin(Star):
             for attr in ("name", "nickname", "nick", "display_name", "display"):
                 value = getattr(component, attr, None)
                 if value:
-                    self.nicknames[qq] = str(value)
+                    self.nicknames.set(scope, qq, str(value))
                     return f"{value} ({qq})"
-        remembered = self.nicknames.get(qq)
+        remembered = self.nicknames.get(scope, qq)
         if remembered:
             return f"{remembered} ({qq})"
         return qq
@@ -623,6 +639,7 @@ class ShinjukuPlugin(Star):
             logger.error(f"新宿：撤回偷偷上机指令消息失败: {exc}")
 
     def _target_from_optional_arg(self, event: AstrMessageEvent) -> str:
+        self._remember_sender_name(event)
         args = self._args(event)
         if args:
             if not self._is_admin(event):
@@ -854,6 +871,7 @@ class ShinjukuPlugin(Star):
     @filter.command("history", alias={"历史记录"})
     async def history_cmd(self, event: AstrMessageEvent):
         """查看自己的历史记录"""
+        self._remember_sender_name(event)
         async def run():
             args = self._args(event)
             limit = int(args[0]) if args and args[0].isdigit() else 5
@@ -865,6 +883,7 @@ class ShinjukuPlugin(Star):
     @filter.command("ahistory")
     async def ahistory_cmd(self, event: AstrMessageEvent):
         """管理员查看指定用户历史记录"""
+        self._remember_sender_name(event)
         async def run():
             if not self._is_admin(event):
                 raise ShinjukuError("权限不足。")
@@ -909,7 +928,11 @@ class ShinjukuPlugin(Star):
         self._remember_sender_name(event)
         async def run():
             users = await self.service.logged_in_users()
-            return _format_players(users, self.nicknames, self.sneak_login_enabled)
+            return _format_players(
+                users,
+                self.nicknames.snapshot(self._nickname_scope(event)),
+                self.sneak_login_enabled,
+            )
 
         yield event.plain_result(await self._safe(run()))
 
