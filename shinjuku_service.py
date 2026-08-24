@@ -25,6 +25,7 @@ POINTS_ASSET_ID = 20001
 MONEY_SCALE = 100
 RATE_SCALE = 10000
 MONEY_MIGRATION_KEY = "money_integer_cents_v1"
+IDENTITY_CONSTRAINTS_MIGRATION_KEY = "identity_session_constraints_v1"
 
 
 class ShinjukuError(Exception):
@@ -183,8 +184,10 @@ class DBConn:
             await cursor.close()
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator["DBConn"]:
+    async def transaction(self, immediate: bool = False) -> AsyncIterator["DBConn"]:
         try:
+            if immediate:
+                await self._conn.execute("BEGIN IMMEDIATE")
             yield self
             await self._conn.commit()
         except BaseException:
@@ -373,6 +376,59 @@ class ShinjukuService:
         except sqlite3.OperationalError:
             pass
         await self._migrate_money_to_integer_cents(conn)
+        await self._ensure_identity_session_constraints(conn)
+
+    async def _ensure_identity_session_constraints(self, conn: DBConn) -> None:
+        """确保 QQ 绑定、活跃会话和单次会话验证码由数据库强制约束。"""
+        raw = conn._conn
+        await raw.execute("BEGIN IMMEDIATE")
+        try:
+            duplicate_bind = await (
+                await raw.execute(
+                    'SELECT type,bid,count(*) FROM "Bind" GROUP BY type,bid HAVING count(*)>1 LIMIT 1'
+                )
+            ).fetchone()
+            if duplicate_bind:
+                raise ShinjukuError(
+                    f"数据库存在重复绑定：{duplicate_bind[0]}:{duplicate_bind[1]}，请先合并重复用户数据。",
+                    "DUPLICATE_BIND_DATA",
+                )
+
+            duplicate_session = await (
+                await raw.execute(
+                    'SELECT "userId",count(*) FROM "Session" WHERE "isActive"=1 '
+                    'GROUP BY "userId" HAVING count(*)>1 LIMIT 1'
+                )
+            ).fetchone()
+            if duplicate_session:
+                raise ShinjukuError(
+                    f"用户 #{duplicate_session[0]} 存在多个活跃会话，请先处理重复上机记录。",
+                    "DUPLICATE_ACTIVE_SESSION_DATA",
+                )
+
+            await raw.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS uq_bind_type_bid ON "Bind"(type,bid)'
+            )
+            await raw.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS uq_session_active_user ON "Session"("userId") '
+                'WHERE "isActive"=1'
+            )
+            await raw.execute(
+                '''CREATE TRIGGER IF NOT EXISTS trg_active_session_checkcode_immutable
+                   BEFORE UPDATE OF "CHECKCODE" ON "Session"
+                   WHEN OLD."isActive"=1 AND OLD."CHECKCODE" IS NOT NEW."CHECKCODE"
+                   BEGIN
+                       SELECT RAISE(ABORT, 'active session checkcode is immutable');
+                   END'''
+            )
+            await raw.execute(
+                'INSERT OR IGNORE INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
+                (IDENTITY_CONSTRAINTS_MIGRATION_KEY, _now().isoformat()),
+            )
+            await raw.commit()
+        except BaseException:
+            await raw.rollback()
+            raise
 
     async def _migrate_money_to_integer_cents(self, conn: DBConn) -> None:
         """一次性把旧库中的元/浮点金额迁移为分/整数金额。"""
@@ -680,7 +736,7 @@ class ShinjukuService:
 
     async def register(self, platform_id: str, register_code: str = "") -> dict[str, Any]:
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 exists = await self.find_user(f"QQ:{platform_id}", conn)
                 if exists:
                     return {"user": exists, "created": False, "gift": None}
@@ -708,7 +764,7 @@ class ShinjukuService:
         generate_checkcode: bool = True,
     ) -> dict[str, Any]:
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在，请先注册。", "USER_NOT_FOUND")
