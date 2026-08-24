@@ -40,11 +40,11 @@ def test_opened_door_uses_exact_three_minute_first_hour_grace(tmp_path, monkeypa
 
         clock["now"] += timedelta(seconds=1)
         charged_preview = await service.billing("QQ:12345")
-        assert charged_preview["billing"]["totalCost"] == 12
+        assert charged_preview["billing"]["totalCost"] == 1200
         assert charged_preview["billing"]["segments"][0]["durationMinutes"] == 60
 
         result = await service.logout("QQ:12345")
-        assert result["billing"]["totalCost"] == 12
+        assert result["billing"]["totalCost"] == 1200
         assert not result.get("loginGraceForced")
         await service.close()
 
@@ -93,10 +93,10 @@ def test_session_without_opened_door_keeps_fifteen_minute_grace(tmp_path, monkey
 
         clock["now"] += timedelta(seconds=1)
         charged_preview = await service.billing("QQ:12345")
-        assert charged_preview["billing"]["totalCost"] == 12
+        assert charged_preview["billing"]["totalCost"] == 1200
 
         result = await service.logout("QQ:12345")
-        assert result["billing"]["totalCost"] == 12
+        assert result["billing"]["totalCost"] == 1200
         assert not result.get("loginGraceForced")
         await service.close()
 
@@ -119,11 +119,11 @@ def test_opened_door_keeps_later_fifteen_minute_rounding(tmp_path, monkeypatch):
 
         clock["now"] += timedelta(hours=1, minutes=15, seconds=59)
         within_grace = await service.billing("QQ:12345")
-        assert within_grace["billing"]["totalCost"] == 12
+        assert within_grace["billing"]["totalCost"] == 1200
 
         clock["now"] += timedelta(seconds=1)
         beyond_grace = await service.billing("QQ:12345")
-        assert beyond_grace["billing"]["totalCost"] == 24
+        assert beyond_grace["billing"]["totalCost"] == 2400
         await service.close()
 
     asyncio.run(run())

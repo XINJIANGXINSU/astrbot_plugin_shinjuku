@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import re
 import secrets
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, AsyncIterator
 
 import aiosqlite
@@ -22,6 +22,9 @@ PAID_CURRENCY_ASSET_ID = 10001
 FREE_CURRENCY_ASSET_ID = 10002
 MONTHLY_PASS_ASSET_ID = 10001
 POINTS_ASSET_ID = 20001
+MONEY_SCALE = 100
+RATE_SCALE = 10000
+MONEY_MIGRATION_KEY = "money_integer_cents_v1"
 
 
 class ShinjukuError(Exception):
@@ -39,11 +42,43 @@ def _json(value: Any) -> Any:
     return value
 
 
-def _money_text(value: Any) -> str:
-    number = float(value or 0)
-    if number.is_integer():
-        return str(int(number))
-    return f"{number:.2f}".rstrip("0").rstrip(".")
+def amount_to_cents(value: Any) -> int:
+    """把用户/配置中的元转换成整数分，统一使用四舍五入（ROUND_HALF_UP）。"""
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ShinjukuError("金额格式不正确。", "INVALID_AMOUNT") from exc
+    if not amount.is_finite():
+        raise ShinjukuError("金额格式不正确。", "INVALID_AMOUNT")
+    return int((amount * MONEY_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def cents_to_text(value: Any) -> str:
+    cents = int(value or 0)
+    sign = "-" if cents < 0 else ""
+    whole, fraction = divmod(abs(cents), MONEY_SCALE)
+    return f"{sign}{whole}" if fraction == 0 else f"{sign}{whole}.{fraction:02d}"
+
+
+def _discount_tenths_to_bps(value: Any) -> int:
+    try:
+        tenths = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT") from exc
+    if not tenths.is_finite():
+        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT")
+    bps = int((tenths * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if not 0 <= bps <= RATE_SCALE:
+        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT")
+    return bps
+
+
+def _discounted_cents(amount_cents: int, rate_bps: int) -> int:
+    return (int(amount_cents) * int(rate_bps) + RATE_SCALE // 2) // RATE_SCALE
+
+
+def _discount_tenths_text(rate_bps: int) -> str:
+    return format((Decimal(int(rate_bps)) / 1000).normalize(), "f")
 
 
 def _now() -> datetime:
@@ -203,7 +238,7 @@ CREATE TABLE IF NOT EXISTS "UserAsset" (
     "assetDefId" INTEGER NOT NULL,
     "assetType" TEXT NOT NULL,
     "assetId" INTEGER REFERENCES "Asset"(id),
-    count REAL NOT NULL DEFAULT 0,
+    count INTEGER NOT NULL DEFAULT 0,
     "activeAt" TEXT,
     "expireAt" TEXT
 );
@@ -248,6 +283,11 @@ CREATE TABLE IF NOT EXISTS "RedeemRecord" (
     "presentId" INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_redeem_record_user ON "RedeemRecord"("userId", "presentId");
+
+CREATE TABLE IF NOT EXISTS "SchemaMigration" (
+    key TEXT PRIMARY KEY,
+    "appliedAt" TEXT NOT NULL
+);
 """
 
 
@@ -332,6 +372,114 @@ class ShinjukuService:
             await conn._conn.execute('CREATE INDEX IF NOT EXISTS idx_session_checkcode ON "Session"("CHECKCODE")')
         except sqlite3.OperationalError:
             pass
+        await self._migrate_money_to_integer_cents(conn)
+
+    async def _migrate_money_to_integer_cents(self, conn: DBConn) -> None:
+        """一次性把旧库中的元/浮点金额迁移为分/整数金额。"""
+        applied = await conn.fetchval('SELECT 1 FROM "SchemaMigration" WHERE key=?', MONEY_MIGRATION_KEY)
+        if applied:
+            return
+
+        raw = conn._conn
+        await raw.execute("BEGIN IMMEDIATE")
+        try:
+            # UserAsset.count 同时存放货币和非货币数量；仅货币乘 100，其他资产取整。
+            await raw.execute("DROP INDEX IF EXISTS idx_userasset_user")
+            await raw.execute('ALTER TABLE "UserAsset" RENAME TO "UserAsset_money_legacy"')
+            await raw.execute(
+                '''CREATE TABLE "UserAsset" (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    "userId" INTEGER NOT NULL REFERENCES "User"(id),
+                    "assetDefId" INTEGER NOT NULL,
+                    "assetType" TEXT NOT NULL,
+                    "assetId" INTEGER REFERENCES "Asset"(id),
+                    count INTEGER NOT NULL DEFAULT 0,
+                    "activeAt" TEXT,
+                    "expireAt" TEXT
+                )'''
+            )
+            await raw.execute(
+                '''INSERT INTO "UserAsset"
+                   (id,"userId","assetDefId","assetType","assetId",count,"activeAt","expireAt")
+                   SELECT id,"userId","assetDefId","assetType","assetId",
+                          CASE WHEN "assetType"=? THEN CAST(ROUND(count * ?) AS INTEGER)
+                               ELSE CAST(ROUND(count) AS INTEGER) END,
+                          "activeAt","expireAt"
+                   FROM "UserAsset_money_legacy"''',
+                (CURRENCY_ASSET_TYPE, MONEY_SCALE),
+            )
+            await raw.execute('DROP TABLE "UserAsset_money_legacy"')
+            await raw.execute('CREATE INDEX idx_userasset_user ON "UserAsset"("userId", "assetType")')
+
+            await raw.execute(
+                'UPDATE "Session" SET "billingCost"=CAST(ROUND("billingCost" * ?) AS INTEGER) '
+                'WHERE "billingCost" IS NOT NULL',
+                (MONEY_SCALE,),
+            )
+            await raw.execute(
+                'UPDATE "Session" SET "finalCost"=CAST(ROUND("finalCost" * ?) AS INTEGER) '
+                'WHERE "finalCost" IS NOT NULL',
+                (MONEY_SCALE,),
+            )
+            session_columns = {
+                row[1] for row in await (await raw.execute('PRAGMA table_info("Session")')).fetchall()
+            }
+            if "costOverwrite" in session_columns:
+                await raw.execute(
+                    'UPDATE "Session" SET "costOverwrite"=CAST(ROUND("costOverwrite" * ?) AS INTEGER) '
+                    'WHERE "costOverwrite" IS NOT NULL',
+                    (MONEY_SCALE,),
+                )
+            await raw.execute(
+                'UPDATE "UserAssetLog" SET '
+                '"changeAmount"=CAST(ROUND("changeAmount" * ?) AS INTEGER), '
+                '"countBefore"=CAST(ROUND("countBefore" * ?) AS INTEGER), '
+                '"countAfter"=CAST(ROUND("countAfter" * ?) AS INTEGER) '
+                'WHERE "assetType"=?',
+                (MONEY_SCALE, MONEY_SCALE, MONEY_SCALE, CURRENCY_ASSET_TYPE),
+            )
+
+            present_rows = await (await raw.execute('SELECT id, body FROM "Present" WHERE body IS NOT NULL')).fetchall()
+            for present_id, body_text in present_rows:
+                body = _json(body_text) or []
+                changed = False
+                for item in body:
+                    if str(item.get("assetType")) == CURRENCY_ASSET_TYPE and "count" in item:
+                        item["count"] = amount_to_cents(item["count"])
+                        changed = True
+                if changed:
+                    await raw.execute(
+                        'UPDATE "Present" SET body=? WHERE id=?',
+                        (json.dumps(body, ensure_ascii=False), present_id),
+                    )
+
+            effect_rows = await (
+                await raw.execute(
+                    'SELECT id, "billingEffect" FROM "Asset" WHERE type=? AND "billingEffect" IS NOT NULL',
+                    (TICKET_ASSET_TYPE,),
+                )
+            ).fetchall()
+            for asset_id, effect_text in effect_rows:
+                effect = _json(effect_text) or {}
+                if effect.get("type") != "RATE" or "rateBps" in effect:
+                    continue
+                rate = Decimal(str(effect.pop("value", 1)))
+                effect["rateBps"] = int(
+                    (rate * RATE_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                )
+                await raw.execute(
+                    'UPDATE "Asset" SET "billingEffect"=? WHERE id=?',
+                    (json.dumps(effect, ensure_ascii=False), asset_id),
+                )
+
+            await raw.execute(
+                'INSERT INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
+                (MONEY_MIGRATION_KEY, _now().isoformat()),
+            )
+            await raw.commit()
+        except BaseException:
+            await raw.rollback()
+            raise
 
     async def _generate_checkcode(self, conn: DBConn) -> str:
         """生成不重复的7位数字验证码（CHECKCODE），仅在活跃会话范围内查重（离场后自动作废释放）。"""
@@ -403,10 +551,10 @@ class ShinjukuService:
     ) -> dict[str, Any]:
         """按会话上下文切分白天/夜晚计费，支持深夜首小时跨午夜和包夜封顶覆盖。"""
         cfg = self.billing_config
-        day_price = int(cfg.get("day_price_pass" if pass_override else "day_price") or 12)
-        day_cap = int(cfg.get("day_cap_pass" if pass_override else "day_cap") or 69)
-        night_price = int(cfg.get("night_price_pass" if pass_override else "night_price") or 13)
-        night_cap = int(cfg.get("night_cap_pass" if pass_override else "night_cap") or 69)
+        day_price = amount_to_cents(cfg.get("day_price_pass" if pass_override else "day_price") or 12)
+        day_cap = amount_to_cents(cfg.get("day_cap_pass" if pass_override else "day_cap") or 69)
+        night_price = amount_to_cents(cfg.get("night_price_pass" if pass_override else "night_price") or 13)
+        night_cap = amount_to_cents(cfg.get("night_cap_pass" if pass_override else "night_cap") or 69)
         day_end_min = self._clock_minutes(str(cfg.get("day_end") or "00:00"))
         night_end_min = self._clock_minutes(str(cfg.get("night_end") or "12:00"))
         grace_minutes = int(cfg.get("grace_minutes") or 0)
@@ -504,7 +652,8 @@ class ShinjukuService:
         """封顶金额折算积分：每 points_per_amount 元得 1 积分（向上取整）。"""
         if self.points_per_amount <= 0 or cap_value <= 0:
             return 0
-        return math.ceil(cap_value / self.points_per_amount)
+        denominator = self.points_per_amount * MONEY_SCALE
+        return (cap_value + denominator - 1) // denominator
 
     async def find_user(self, uid: str | int, conn: DBConn | None = None) -> dict[str, Any] | None:
         owns_conn = conn is None
@@ -569,7 +718,7 @@ class ShinjukuService:
                 if wallet["total"]["available"] < 0:
                     debt = -wallet["total"]["available"]
                     raise ShinjukuError(
-                        f"当前欠费 {_money_text(debt)} {self.currency}，请先充值后再入场。",
+                        f"当前欠费 {cents_to_text(debt)} {self.currency}，请先充值后再入场。",
                         "INSUFFICIENT_BALANCE_FOR_LOGIN",
                     )
                 if self.self_open_door_enabled and generate_checkcode:
@@ -681,7 +830,7 @@ class ShinjukuService:
                 cost = session.get("costOverwrite")
                 if cost is None:
                     cost = discount["finalCost"] if discount else billing["totalCost"]
-                cost = round(float(cost), 2)
+                cost = int(cost)
 
                 if cost > 0:
                     await self.deduct_wallet(str(session["userId"]), cost, "会话结算: SESSION_SETTLEMENT", conn)
@@ -751,9 +900,9 @@ class ShinjukuService:
             asset.get("assetDefId") == MONTHLY_PASS_ASSET_ID and asset.get("assetType") == PASS_ASSET_TYPE
             for asset in wallet["passes"].get("details", {}).get("available", [])
         )
-        cap24 = int(self.billing_config.get("cap_24h_pass" if monthly_pass else "cap_24h") or 0)
-        day_cap = int(self.billing_config.get("day_cap_pass" if monthly_pass else "day_cap") or 69)
-        night_cap = int(self.billing_config.get("night_cap_pass" if monthly_pass else "night_cap") or 69)
+        cap24 = amount_to_cents(self.billing_config.get("cap_24h_pass" if monthly_pass else "cap_24h") or 0)
+        day_cap = amount_to_cents(self.billing_config.get("day_cap_pass" if monthly_pass else "day_cap") or 69)
+        night_cap = amount_to_cents(self.billing_config.get("night_cap_pass" if monthly_pass else "night_cap") or 69)
         # 按 24 小时块逐块封顶：每个从入场时刻起的 24 小时块最多收 cap24
         segments: list[dict[str, Any]] = []
         blocks: list[dict[str, Any]] = []
@@ -821,10 +970,10 @@ class ShinjukuService:
         response = {"session": session, "billing": result, "wallet": wallet}
 
         coupon = self._best_coupon(wallet)
-        if coupon and coupon["value"] < 1:
+        if coupon and coupon["rateBps"] < RATE_SCALE:
             total = response["billing"]["totalCost"]
             if total > 0:
-                final_cost = round(total * coupon["value"], 2)
+                final_cost = _discounted_cents(total, coupon["rateBps"])
                 response["discount"] = {
                     "originalCost": total,
                     "finalCost": final_cost,
@@ -833,7 +982,7 @@ class ShinjukuService:
                         {
                             "asset": coupon["name"],
                             "assetId": coupon["id"],
-                            "saved": round(total - final_cost, 2),
+                            "saved": total - final_cost,
                             "type": "RATE",
                             "breakdown": [],
                         }
@@ -843,7 +992,7 @@ class ShinjukuService:
 
     @staticmethod
     def _best_coupon(wallet: dict[str, Any]) -> dict[str, Any] | None:
-        """从可用优惠券中选折扣最大（value 最小）的一张。"""
+        """从可用优惠券中选折扣最大（rateBps 最小）的一张。"""
         candidates = [
             asset
             for asset in wallet["tickets"].get("details", {}).get("available", [])
@@ -853,13 +1002,13 @@ class ShinjukuService:
             return None
         best = min(
             candidates,
-            key=lambda a: (a["asset"]["billingEffect"]["value"], a.get("expireAt") or datetime.max),
+            key=lambda a: (a["asset"]["billingEffect"]["rateBps"], a.get("expireAt") or datetime.max),
         )
         effect = best["asset"]["billingEffect"]
         return {
             "id": best["id"],
             "name": best["asset"].get("name") or "优惠券",
-            "value": float(effect["value"]),
+            "rateBps": int(effect["rateBps"]),
         }
 
     async def history(self, uid: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -928,10 +1077,10 @@ class ShinjukuService:
         free_available = [a for a in free if available(a)]
         ticket_available = [a for a in tickets if available(a)]
         pass_available = [a for a in passes if available(a)]
-        paid_amount = sum(float(a["count"]) for a in paid)
-        free_available_amount = sum(float(a["count"]) for a in free_available)
-        free_total_amount = sum(float(a["count"]) for a in free)
-        points_amount = sum(float(a["count"]) for a in points)
+        paid_amount = sum(int(a["count"]) for a in paid)
+        free_available_amount = sum(int(a["count"]) for a in free_available)
+        free_total_amount = sum(int(a["count"]) for a in free)
+        points_amount = sum(int(a["count"]) for a in points)
         wallet = {
             "total": {"available": paid_amount + free_available_amount, "all": paid_amount + free_total_amount},
             "paid": {"available": paid_amount, "all": paid_amount},
@@ -1009,12 +1158,15 @@ class ShinjukuService:
             )
         )
 
-    async def add_paid_currency(self, uid: str, amount: float, comment: str = "admin add") -> dict[str, Any]:
+    async def add_paid_currency(self, uid: str, amount_cents: int, comment: str = "admin add") -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction():
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
+                amount_cents = int(amount_cents)
+                if amount_cents <= 0:
+                    raise ShinjukuError("添加金额必须大于 0。", "INVALID_AMOUNT")
                 wallet = await self.wallet(uid, False, conn)
                 asset = await self.ensure_currency_asset(conn)
                 existing = _row(
@@ -1030,7 +1182,7 @@ class ShinjukuService:
                 if existing:
                     await conn.execute(
                         'UPDATE "UserAsset" SET count=count+? WHERE id=?',
-                        amount,
+                        amount_cents,
                         existing["id"],
                     )
                     updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
@@ -1044,7 +1196,7 @@ class ShinjukuService:
                         PAID_CURRENCY_ASSET_ID,
                         CURRENCY_ASSET_TYPE,
                         asset["id"],
-                        amount,
+                        amount_cents,
                     )
                     changed = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', created.lastrowid))
                     await self.log_asset_change(conn, changed, 0, "CREATE", comment)
@@ -1052,7 +1204,7 @@ class ShinjukuService:
                 return {
                     "originalBalance": wallet["total"]["available"],
                     "finalBalance": final_wallet["total"]["available"],
-                    "amount": amount,
+                    "amount": amount_cents,
                     "changedRows": [changed],
                 }
 
@@ -1104,19 +1256,22 @@ class ShinjukuService:
             await self.log_asset_change(conn, changed, 0, "CREATE", comment)
         return {"changedRows": [changed], "amount": amount}
 
-    async def charge_wallet(self, uid: str, amount: float, comment: str = "admin charge") -> dict[str, Any]:
+    async def charge_wallet(self, uid: str, amount_cents: int, comment: str = "admin charge") -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction():
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
+                amount_cents = int(amount_cents)
+                if amount_cents <= 0:
+                    raise ShinjukuError("扣费金额必须大于 0。", "INVALID_AMOUNT")
                 wallet = await self.wallet(uid, False, conn)
-                await self.deduct_wallet(uid, amount, comment, conn)
+                await self.deduct_wallet(uid, amount_cents, comment, conn)
                 final_wallet = await self.wallet(uid, False, conn)
                 return {
                     "originalBalance": wallet["total"]["available"],
                     "finalBalance": final_wallet["total"]["available"],
-                    "amount": amount,
+                    "amount": amount_cents,
                 }
 
     async def add_pass(self, uid: str, days: int = 30, comment: str = "admin member") -> dict[str, Any]:
@@ -1196,19 +1351,17 @@ class ShinjukuService:
         )
         return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
-    async def grant_coupon(self, uid: str, discount_tenths: float, days: int = 30, comment: str = "admin coupon") -> dict[str, Any]:
+    async def grant_coupon(self, uid: str, discount_tenths: Any, days: int = 30, comment: str = "admin coupon") -> dict[str, Any]:
         """发放优惠券：discount_tenths 为 0-10 折（8 表示 8 折，付 80%），默认有效期 30 天。"""
         async with self._acquire() as conn:
             async with conn.transaction():
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-                tenths = float(discount_tenths)
-                if not (0 <= tenths <= 10):
-                    raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT")
+                rate_bps = _discount_tenths_to_bps(discount_tenths)
                 if int(days) <= 0:
                     raise ShinjukuError("优惠券有效天数必须大于 0。", "INVALID_DAYS")
-                asset = await self.ensure_coupon_asset(conn, tenths)
+                asset = await self.ensure_coupon_asset(conn, rate_bps)
                 duration_ms = int(days) * 86400000
                 user_asset = await self.add_asset_by_def(
                     user["id"],
@@ -1222,12 +1375,13 @@ class ShinjukuService:
                     "user": user,
                     "asset": asset,
                     "userAsset": user_asset,
-                    "discount_tenths": tenths,
+                    "discount_tenths": _discount_tenths_text(rate_bps),
                     "days": int(days),
                 }
 
-    async def ensure_coupon_asset(self, conn: DBConn, discount_tenths: float) -> dict[str, Any]:
-        def_id = int(20000 + round(float(discount_tenths) * 10))
+    async def ensure_coupon_asset(self, conn: DBConn, rate_bps: int) -> dict[str, Any]:
+        rate_bps = int(rate_bps)
+        def_id = 200000 + rate_bps
         asset = _row(
             await conn.fetchrow(
                 'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
@@ -1237,8 +1391,8 @@ class ShinjukuService:
         )
         if asset:
             return asset
-        tenths = float(discount_tenths)
-        name = "免费券" if tenths == 0 else f"{tenths:g}折优惠券"
+        tenths_text = _discount_tenths_text(rate_bps)
+        name = "免费券" if rate_bps == 0 else f"{tenths_text}折优惠券"
         created = await conn.execute(
             'INSERT INTO "Asset" ("assetId",type,name,description,"billingEffect",valid) VALUES (?,?,?,?,?,1)',
             def_id,
@@ -1248,7 +1402,7 @@ class ShinjukuService:
             json.dumps(
                 {
                     "type": "RATE",
-                    "value": tenths / 10,
+                    "rateBps": rate_bps,
                     "priority": 50,
                     "stackable": False,
                     "consume": False,
@@ -1258,22 +1412,22 @@ class ShinjukuService:
         )
         return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
-    async def deduct_wallet(self, uid: str, amount: float, comment: str, conn: DBConn) -> None:
+    async def deduct_wallet(self, uid: str, amount_cents: int, comment: str, conn: DBConn) -> None:
         wallet = await self.wallet(uid, True, conn)
         user = await self.find_user(uid, conn)
         if not user:
             raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        remaining = amount
+        remaining = int(amount_cents)
         candidates = [
             asset
             for asset in wallet["free"]["details"]["available"] + wallet["paid"]["details"]["available"]
-            if float(asset["count"]) > 0
+            if int(asset["count"]) > 0
         ]
         for asset in candidates:
             if remaining <= 0:
                 break
-            deduct = min(float(asset["count"]), remaining)
-            new_count = float(asset["count"]) - deduct
+            deduct = min(int(asset["count"]), remaining)
+            new_count = int(asset["count"]) - deduct
             if new_count <= 0:
                 await conn.execute('DELETE FROM "UserAsset" WHERE id=?', asset["id"])
                 changed = dict(asset)
@@ -1298,7 +1452,7 @@ class ShinjukuService:
                 )
             )
             if existing:
-                new_count = float(existing["count"]) - remaining
+                new_count = int(existing["count"]) - remaining
                 await conn.execute('UPDATE "UserAsset" SET count=? WHERE id=?', new_count, existing["id"])
                 updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
                 await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
@@ -1328,7 +1482,7 @@ class ShinjukuService:
         self,
         conn: DBConn,
         asset: dict[str, Any],
-        original_count: float,
+        original_count: int,
         action: str,
         comment: str,
     ) -> None:
@@ -1339,9 +1493,9 @@ class ShinjukuService:
             asset.get("id"),
             asset["assetDefId"],
             asset["assetType"],
-            int(float(asset["count"]) - float(original_count)),
-            int(float(original_count)),
-            int(float(asset["count"])),
+            int(asset["count"]) - int(original_count),
+            int(original_count),
+            int(asset["count"]),
             None,
             asset.get("expireAt"),
             action,
@@ -1401,15 +1555,15 @@ class ShinjukuService:
         )
         return {"present": present, "assets": assets}
 
-    async def create_gift_code(self, present_id: int, currency_amount: float, max_use_count: int) -> dict[str, Any]:
+    async def create_gift_code(self, present_id: int, currency_amount_cents: int, max_use_count: int) -> dict[str, Any]:
         """基于现有礼包生成兑换码：货币数量按参数覆盖，每人限领一次，总数封顶 max_use_count。"""
         async with self._acquire() as conn:
             async with conn.transaction():
                 present = _row(await conn.fetchrow('SELECT * FROM "Present" WHERE id=?', present_id))
                 if not present:
                     raise ShinjukuError("礼包不存在。", "ASSET_NOT_FOUND")
-                amount = float(currency_amount)
-                if amount <= 0:
+                amount_cents = int(currency_amount_cents)
+                if amount_cents <= 0:
                     raise ShinjukuError("货币数量必须大于 0。", "INVALID_AMOUNT")
                 uses = int(max_use_count)
                 if uses <= 0:
@@ -1427,10 +1581,14 @@ class ShinjukuService:
                     None,
                 )
                 if currency_item:
-                    currency_item["count"] = amount
+                    currency_item["count"] = amount_cents
                 else:
                     new_body.append(
-                        {"assetType": CURRENCY_ASSET_TYPE, "assetId": PAID_CURRENCY_ASSET_ID, "count": amount}
+                        {
+                            "assetType": CURRENCY_ASSET_TYPE,
+                            "assetId": PAID_CURRENCY_ASSET_ID,
+                            "count": amount_cents,
+                        }
                     )
                 name = f"{present.get('name') or '礼包'}·兑换码"
                 created = await conn.execute(
@@ -1448,7 +1606,7 @@ class ShinjukuService:
                 return {
                     "code": code,
                     "name": name,
-                    "currency_amount": amount,
+                    "currency_amount": amount_cents,
                     "max_use_count": uses,
                 }
 
@@ -1482,7 +1640,7 @@ class ShinjukuService:
         for item in body:
             if item.get("oncePerUser") and user_redeem_count > 0:
                 continue
-            amount = float(item.get("count") or 1)
+            amount = int(item["count"]) if "count" in item else 1
             if item.get("id"):
                 asset = _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', int(item["id"])))
             else:
@@ -1541,7 +1699,7 @@ class ShinjukuService:
         self,
         uid: str | int,
         asset: dict[str, Any],
-        amount: float,
+        amount: int,
         comment: str,
         conn: DBConn,
         options: dict[str, Any] | None = None,
@@ -1550,6 +1708,7 @@ class ShinjukuService:
         if not user:
             raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
         options = options or {}
+        amount = int(amount)
         active_at = _as_dt(options.get("activeAt"))
         expire_at = _as_dt(options.get("expireAt")) or _future_dt(options.get("durationMs"))
         merge_strategy = str(options.get("mergeStrategy") or "STACK").upper()
