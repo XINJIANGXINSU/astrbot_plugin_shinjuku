@@ -639,9 +639,15 @@ class ShinjukuService:
                 if not session_before:
                     raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
                 played_seconds = int((_now() - session_before["createdAt"]).total_seconds())
-                played_minutes = played_seconds // 60
-                # 入场限制时间：只影响第一个小时内的离场（≤login_grace_minutes 分钟当强制离场，>login_grace_minutes 且 <60 分钟按 1 小时保底结算）
-                force_mode = played_minutes <= self.login_grace_minutes and played_seconds < 3600
+                door_opened = bool(int(session_before.get("doorOpened") or 0))
+                login_grace_seconds = self.login_grace_minutes * 60
+                # 只有成功自助开门的会话才启用首小时特殊门槛：
+                # 入场后不超过 login_grace_minutes 分钟离场时免费，超过后首小时按 1 小时计费。
+                force_mode = (
+                    door_opened
+                    and played_seconds <= login_grace_seconds
+                    and played_seconds < 3600
+                )
                 if force_mode:
                     # 按强制离场处理：0 元、不扣钱、不发积分、不消耗优惠券（和 force_logout 一样）
                     wallet_before = await self.wallet(uid, False, conn)
@@ -671,46 +677,6 @@ class ShinjukuService:
                 wallet_before = preview["wallet"]
                 session = preview["session"]
                 billing = preview["billing"]
-                # 入场限制时间：第一个小时不足 1 小时（但已超过 login_grace_minutes），按 1 小时保底计费
-                if played_seconds < 3600 and played_minutes > self.login_grace_minutes and len(billing["segments"]) == 0:
-                    current = session["createdAt"]
-                    minute_of_day = current.hour * 60 + current.minute
-                    day_start = self._clock_minutes(str(self.billing_config.get("day_start") or "11:30"))
-                    is_day = minute_of_day >= day_start
-                    cfg_key_price = ("day_price_pass" if self._has_pass_for_billing(preview["wallet"]) else "day_price") if is_day else \
-                                   ("night_price_pass" if self._has_pass_for_billing(preview["wallet"]) else "night_price")
-                    cfg_key_cap = ("day_cap_pass" if self._has_pass_for_billing(preview["wallet"]) else "day_cap") if is_day else \
-                                 ("night_cap_pass" if self._has_pass_for_billing(preview["wallet"]) else "night_cap")
-                    rate = int(self.billing_config.get(cfg_key_price) or (12 if is_day else 13))
-                    cap = int(self.billing_config.get(cfg_key_cap) or 69)
-                    raw_cost = rate * 1
-                    seg_cost = min(raw_cost, cap)
-                    end_time = current + timedelta(hours=1)
-                    placeholder_seg = {
-                        "ruleId": 1 if is_day else 2,
-                        "ruleName": "白天计费" if is_day else "夜晚计费",
-                        "startTime": current,
-                        "endTime": end_time,
-                        "durationMinutes": 60,
-                        "cost": seg_cost,
-                        "isCapped": raw_cost > cap,
-                        "blockIndex": 0,
-                    }
-                    block24_end = min(current + timedelta(days=1), end_time)
-                    billing["segments"] = [placeholder_seg]
-                    billing["blocks"] = [
-                        {
-                            "startTime": current,
-                            "endTime": block24_end,
-                            "rawCost": seg_cost,
-                            "cappedCost": seg_cost,
-                            "isCapped": False,
-                        }
-                    ]
-                    billing["totalCost"] = seg_cost
-                    billing["points"] = 0 if placeholder_seg["isCapped"] else 1
-                    if placeholder_seg["isCapped"]:
-                        billing["points"] = self._cap_points(cap)
                 discount = preview.get("discount")
                 cost = session.get("costOverwrite")
                 if cost is None:
@@ -772,6 +738,14 @@ class ShinjukuService:
         if not session:
             raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
         end = session.get("closedAt") or _now()
+        calculation_end = end
+        played_seconds = max(0, int((end - session["createdAt"]).total_seconds()))
+        door_opened = bool(int(session.get("doorOpened") or 0))
+        login_grace_seconds = self.login_grace_minutes * 60
+        if door_opened and login_grace_seconds < played_seconds < 3600:
+            # 成功开门后，超过首小时特殊门槛即按完整 1 小时预览和结算。
+            # 顶层 endTime 仍保留真实查询/退场时间，只有计费区间扩展到首小时末。
+            calculation_end = session["createdAt"] + timedelta(hours=1)
         wallet = await self.wallet(uid, True, conn)
         monthly_pass = any(
             asset.get("assetDefId") == MONTHLY_PASS_ASSET_ID and asset.get("assetType") == PASS_ASSET_TYPE
@@ -787,8 +761,8 @@ class ShinjukuService:
         total_cost = 0
         total_points = 0
         current = session["createdAt"]
-        while current < end:
-            block_end = min(current + timedelta(days=1), end)
+        while current < calculation_end:
+            block_end = min(current + timedelta(days=1), calculation_end)
             block = self.calculate_billing(
                 current,
                 block_end,
