@@ -12,14 +12,15 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .shinjuku_service import ShinjukuError, ShinjukuService
+from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents, cents_to_text
 
 
 def _money(value: Any) -> str:
-    number = float(value or 0)
-    if number.is_integer():
-        return str(int(number))
-    return f"{number:.2f}".rstrip("0").rstrip(".")
+    return cents_to_text(value)
+
+
+def _number(value: Any) -> str:
+    return str(int(value or 0))
 
 
 def _dt(value: Any) -> str:
@@ -103,7 +104,7 @@ def _format_wallet(wallet: dict[str, Any], currency: str) -> str:
         f"总余额: {_money(wallet['total']['available'])}/{_money(wallet['total']['all'])} {currency}",
         f"付费余额: {_money(wallet['paid']['available'])} {currency}",
         f"免费余额: {_money(wallet['free']['available'])}/{_money(wallet['free']['all'])} {currency}",
-        f"积分: {_money(wallet['points']['available'])}",
+        f"积分: {_number(wallet['points']['available'])}",
         f"优惠券: {wallet['tickets']['available']}/{wallet['tickets']['all']} 张",
         f"通行证: {wallet['passes']['available']}/{wallet['passes']['all']} 个",
     ]
@@ -111,16 +112,16 @@ def _format_wallet(wallet: dict[str, Any], currency: str) -> str:
 
 
 def _format_pricing(cfg: dict[str, Any], currency: str) -> str:
-    day_price = int(cfg.get("day_price") or 12)
-    day_price_pass = int(cfg.get("day_price_pass") or 11)
-    day_cap = int(cfg.get("day_cap") or 69)
-    day_cap_pass = int(cfg.get("day_cap_pass") or 59)
-    night_price = int(cfg.get("night_price") or 13)
-    night_price_pass = int(cfg.get("night_price_pass") or 12)
-    night_cap = int(cfg.get("night_cap") or 69)
-    night_cap_pass = int(cfg.get("night_cap_pass") or 59)
-    cap_24h = int(cfg.get("cap_24h") or 99)
-    cap_24h_pass = int(cfg.get("cap_24h_pass") or 88)
+    day_price = amount_to_cents(cfg.get("day_price") or 12)
+    day_price_pass = amount_to_cents(cfg.get("day_price_pass") or 11)
+    day_cap = amount_to_cents(cfg.get("day_cap") or 69)
+    day_cap_pass = amount_to_cents(cfg.get("day_cap_pass") or 59)
+    night_price = amount_to_cents(cfg.get("night_price") or 13)
+    night_price_pass = amount_to_cents(cfg.get("night_price_pass") or 12)
+    night_cap = amount_to_cents(cfg.get("night_cap") or 69)
+    night_cap_pass = amount_to_cents(cfg.get("night_cap_pass") or 59)
+    cap_24h = amount_to_cents(cfg.get("cap_24h") or 99)
+    cap_24h_pass = amount_to_cents(cfg.get("cap_24h_pass") or 88)
     day_start = str(cfg.get("day_start") or "11:30")
     day_end = str(cfg.get("day_end") or "00:00")
     night_start = str(cfg.get("night_start") or "00:00")
@@ -235,7 +236,7 @@ def _format_leave_billing(res: dict[str, Any], currency: str, user_label: str) -
     )
     points_earned = res.get("pointsEarned")
     if points_earned:
-        lines.append(f"🎁 本次游玩获得 {_money(points_earned)} 积分")
+        lines.append(f"🎁 本次游玩获得 {_number(points_earned)} 积分")
     lines.extend(["---", "计费区间:"])
     if billing["segments"]:
         lines.extend(_format_billing_blocks(billing, currency))
@@ -271,8 +272,9 @@ def _format_items(
             suffix = "积分"
         else:
             suffix = "个"
+        count_text = _money(item["count"]) if asset_type == "CURRENCY" else _number(item["count"])
         lines.append(
-            f"[{item['id']}] {name} x{_money(item['count'])} {suffix}"
+            f"[{item['id']}] {name} x{count_text} {suffix}"
             f"｜生效: {_dt(item.get('activeAt'))}｜过期: {_dt(item.get('expireAt'))}"
         )
     if mahjong_rank:
@@ -334,7 +336,7 @@ def _format_players(users: list[dict[str, Any]], nicknames: dict[str, str] | Non
     return "\n".join(lines)
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.2.3")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.0")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -680,7 +682,7 @@ class ShinjukuPlugin(Star):
             can_self_open_door = False
             if self.self_open_door_enabled:
                 wallet = await self.service.wallet(uid)
-                points = float(wallet["points"]["available"] or 0)
+                points = int(wallet["points"]["available"] or 0)
                 can_self_open_door = points > self.self_open_door_points_threshold
             login_result = await self.service.login(uid, generate_checkcode=can_self_open_door)
             session = login_result["session"]
@@ -731,7 +733,7 @@ class ShinjukuPlugin(Star):
             if not await self.service.find_user(uid):
                 return "用户未注册"
             wallet = await self.service.wallet(uid)
-            points = float(wallet["points"]["available"] or 0)
+            points = int(wallet["points"]["available"] or 0)
             if points <= self.sneak_login_points_threshold:
                 return (
                     f"（积分需高于 {self.sneak_login_points_threshold}）"
@@ -943,10 +945,10 @@ class ShinjukuPlugin(Star):
             at_ids = self._at_ids(event)
             if len(args) == 1 and at_ids:
                 uid = f"QQ:{at_ids[0]}"
-                amount = float(args[0])
+                amount = amount_to_cents(args[0])
             elif len(args) >= 2:
                 uid = f"QQ:{at_ids[0]}" if at_ids else self._normalize_user(args[0], event, allow_self=False)
-                amount = float(args[-1])
+                amount = amount_to_cents(args[-1])
             else:
                 raise ShinjukuError("用法：/add @用户 金额")
             if amount <= 0:
@@ -1003,17 +1005,17 @@ class ShinjukuPlugin(Star):
                 nums = [arg for arg in args if not arg.startswith("@")]
                 if not nums:
                     raise ShinjukuError("用法：/coupon @用户 折扣 [天数]")
-                tenths = float(nums[0])
+                tenths = nums[0]
                 days = int(nums[1]) if len(nums) > 1 else 30
             elif len(args) >= 2:
                 uid = self._normalize_user(args[0], event, allow_self=False)
-                tenths = float(args[1])
+                tenths = args[1]
                 days = int(args[2]) if len(args) > 2 else 30
             else:
                 raise ShinjukuError("用法：/coupon @用户 折扣 [天数]")
             prefix = await self._ensure_registered(uid, self._at_label(event, uid))
             result = await self.service.grant_coupon(uid, tenths, days, f"coupon grant by {self._sender_id(event)}")
-            label = result["asset"].get("name") or f"{result['discount_tenths']:g}折优惠券"
+            label = result["asset"].get("name") or f"{result['discount_tenths']}折优惠券"
             user_label = await self._masked_label(uid, self._at_label(event, uid))
             return (
                 prefix +
@@ -1034,7 +1036,7 @@ class ShinjukuPlugin(Star):
                 raise ShinjukuError("用法：/giftcode 礼包ID 货币数量 次数")
             try:
                 present_id = int(args[0])
-                amount = float(args[1])
+                amount = amount_to_cents(args[1])
                 times = int(args[2])
             except ValueError:
                 raise ShinjukuError("用法：/giftcode 礼包ID 货币数量 次数")
@@ -1058,10 +1060,10 @@ class ShinjukuPlugin(Star):
             at_ids = self._at_ids(event)
             if len(args) == 1 and at_ids:
                 uid = f"QQ:{at_ids[0]}"
-                amount = float(args[0])
+                amount = amount_to_cents(args[0])
             elif len(args) >= 2:
                 uid = f"QQ:{at_ids[0]}" if at_ids else self._normalize_user(args[0], event, allow_self=False)
-                amount = float(args[-1])
+                amount = amount_to_cents(args[-1])
             else:
                 raise ShinjukuError("用法：/mj @用户 金额")
             if amount <= 0:
@@ -1084,7 +1086,7 @@ class ShinjukuPlugin(Star):
             uid = self._sender_uid(event)
             if await self.service.find_user(uid):
                 wallet = await self.service.wallet(uid)
-                points = float(wallet["points"]["available"] or 0)
+                points = int(wallet["points"]["available"] or 0)
                 if points <= self.self_open_door_points_threshold:
                     return (
                         f"（积分需高于 {self.self_open_door_points_threshold}）"
