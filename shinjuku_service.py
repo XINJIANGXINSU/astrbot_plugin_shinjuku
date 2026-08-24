@@ -26,6 +26,7 @@ MONEY_SCALE = 100
 RATE_SCALE = 10000
 MONEY_MIGRATION_KEY = "money_integer_cents_v1"
 IDENTITY_CONSTRAINTS_MIGRATION_KEY = "identity_session_constraints_v1"
+ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY = "asset_redeem_constraints_v1"
 
 
 class ShinjukuError(Exception):
@@ -377,6 +378,77 @@ class ShinjukuService:
             pass
         await self._migrate_money_to_integer_cents(conn)
         await self._ensure_identity_session_constraints(conn)
+        await self._ensure_asset_redeem_constraints(conn)
+
+    async def _ensure_asset_redeem_constraints(self, conn: DBConn) -> None:
+        """确保资产定义、兑换码和一次性礼包领取由数据库强制约束。"""
+        raw = conn._conn
+        await raw.execute("BEGIN IMMEDIATE")
+        try:
+            duplicate_asset = await (
+                await raw.execute(
+                    'SELECT type,"assetId",count(*) FROM "Asset" '
+                    'GROUP BY type,"assetId" HAVING count(*)>1 LIMIT 1'
+                )
+            ).fetchone()
+            if duplicate_asset:
+                raise ShinjukuError(
+                    f"数据库存在重复资产定义：{duplicate_asset[0]}:{duplicate_asset[1]}，请先合并重复数据。",
+                    "DUPLICATE_ASSET_DEFINITION_DATA",
+                )
+
+            duplicate_code = await (
+                await raw.execute(
+                    'SELECT code,count(*) FROM "Redeem" GROUP BY code HAVING count(*)>1 LIMIT 1'
+                )
+            ).fetchone()
+            if duplicate_code:
+                raise ShinjukuError(
+                    f"数据库存在重复兑换码：{duplicate_code[0]}，请先处理重复数据。",
+                    "DUPLICATE_REDEEM_CODE_DATA",
+                )
+
+            duplicate_once = await (
+                await raw.execute(
+                    'SELECT rr."userId",rr."presentId",count(*) FROM "RedeemRecord" rr '
+                    'JOIN "Present" p ON p.id=rr."presentId" WHERE p."oncePerUser"=1 '
+                    'GROUP BY rr."userId",rr."presentId" HAVING count(*)>1 LIMIT 1'
+                )
+            ).fetchone()
+            if duplicate_once:
+                raise ShinjukuError(
+                    f"用户 #{duplicate_once[0]} 已重复领取一次性礼包 #{duplicate_once[1]}，请先处理重复记录。",
+                    "DUPLICATE_ONCE_PRESENT_DATA",
+                )
+
+            await raw.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS uq_asset_type_asset_id ON "Asset"(type,"assetId")'
+            )
+            await raw.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS uq_redeem_code ON "Redeem"(code)'
+            )
+            await raw.execute(
+                '''CREATE TRIGGER IF NOT EXISTS trg_once_present_redeem_unique
+                   BEFORE INSERT ON "RedeemRecord"
+                   WHEN EXISTS (
+                       SELECT 1 FROM "Present" p
+                       WHERE p.id=NEW."presentId" AND p."oncePerUser"=1
+                   ) AND EXISTS (
+                       SELECT 1 FROM "RedeemRecord" rr
+                       WHERE rr."userId"=NEW."userId" AND rr."presentId"=NEW."presentId"
+                   )
+                   BEGIN
+                       SELECT RAISE(ABORT, 'once-per-user present already redeemed');
+                   END'''
+            )
+            await raw.execute(
+                'INSERT OR IGNORE INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
+                (ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY, _now().isoformat()),
+            )
+            await raw.commit()
+        except BaseException:
+            await raw.rollback()
+            raise
 
     async def _ensure_identity_session_constraints(self, conn: DBConn) -> None:
         """确保 QQ 绑定、活跃会话和单次会话验证码由数据库强制约束。"""
@@ -839,7 +911,7 @@ class ShinjukuService:
 
     async def logout(self, uid: str) -> dict[str, Any]:
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 session_before = await self.active_session(uid, conn)
                 if not session_before:
                     raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
@@ -1216,7 +1288,7 @@ class ShinjukuService:
 
     async def add_paid_currency(self, uid: str, amount_cents: int, comment: str = "admin add") -> dict[str, Any]:
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
@@ -1274,7 +1346,7 @@ class ShinjukuService:
         owns_conn = conn is None
         if owns_conn:
             async with self._acquire() as acquired:
-                async with acquired.transaction():
+                async with acquired.transaction(immediate=True):
                     return await self.add_points(uid, amount, comment, acquired)
 
         user = await self.find_user(uid, conn)
@@ -1314,7 +1386,7 @@ class ShinjukuService:
 
     async def charge_wallet(self, uid: str, amount_cents: int, comment: str = "admin charge") -> dict[str, Any]:
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
@@ -1333,7 +1405,7 @@ class ShinjukuService:
     async def add_pass(self, uid: str, days: int = 30, comment: str = "admin member") -> dict[str, Any]:
         """为用户发放通行证，与已有通行证自动续期叠加。"""
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
@@ -1350,67 +1422,66 @@ class ShinjukuService:
                     {"durationMs": duration_ms, "mergeStrategy": "EXTEND_TIME"},
                 )
 
-    async def ensure_currency_asset(self, conn: DBConn) -> dict[str, Any]:
+    async def _ensure_asset_definition(
+        self,
+        conn: DBConn,
+        asset_id: int,
+        asset_type: str,
+        name: str,
+        description: str,
+        billing_effect: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await conn.execute(
+            'INSERT OR IGNORE INTO "Asset" '
+            '("assetId",type,name,description,"billingEffect",valid) VALUES (?,?,?,?,?,1)',
+            asset_id,
+            asset_type,
+            name,
+            description,
+            json.dumps(billing_effect) if billing_effect is not None else None,
+        )
         asset = _row(
             await conn.fetchrow(
                 'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                CURRENCY_ASSET_TYPE,
-                PAID_CURRENCY_ASSET_ID,
+                asset_type,
+                asset_id,
             )
         )
-        if asset:
-            return asset
-        created = await conn.execute(
-            'INSERT INTO "Asset" ("assetId",type,name,description,valid) VALUES (?,?,?,?,1)',
+        if not asset:
+            raise ShinjukuError("资产定义创建失败。", "ASSET_DEFINITION_CREATE_FAILED")
+        return asset
+
+    async def ensure_currency_asset(self, conn: DBConn) -> dict[str, Any]:
+        return await self._ensure_asset_definition(
+            conn,
             PAID_CURRENCY_ASSET_ID,
             CURRENCY_ASSET_TYPE,
             self.currency,
             "AstrBot 插件自动创建的付费货币资产定义",
         )
-        return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
     async def ensure_points_asset(self, conn: DBConn) -> dict[str, Any]:
-        asset = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                POINTS_ASSET_TYPE,
-                POINTS_ASSET_ID,
-            )
-        )
-        if asset:
-            return asset
-        created = await conn.execute(
-            'INSERT INTO "Asset" ("assetId",type,name,description,valid) VALUES (?,?,?,?,1)',
+        return await self._ensure_asset_definition(
+            conn,
             POINTS_ASSET_ID,
             POINTS_ASSET_TYPE,
             "积分",
             "新宿插件自动创建的积分资产定义",
         )
-        return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
     async def ensure_pass_asset(self, conn: DBConn) -> dict[str, Any]:
-        asset = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                PASS_ASSET_TYPE,
-                MONTHLY_PASS_ASSET_ID,
-            )
-        )
-        if asset:
-            return asset
-        created = await conn.execute(
-            'INSERT INTO "Asset" ("assetId",type,name,description,valid) VALUES (?,?,?,?,1)',
+        return await self._ensure_asset_definition(
+            conn,
             MONTHLY_PASS_ASSET_ID,
             PASS_ASSET_TYPE,
             "通行证",
             "新宿插件自动创建的通行证资产定义",
         )
-        return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
     async def grant_coupon(self, uid: str, discount_tenths: Any, days: int = 30, comment: str = "admin coupon") -> dict[str, Any]:
         """发放优惠券：discount_tenths 为 0-10 折（8 表示 8 折，付 80%），默认有效期 30 天。"""
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 user = await self.find_user(uid, conn)
                 if not user:
                     raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
@@ -1438,35 +1509,23 @@ class ShinjukuService:
     async def ensure_coupon_asset(self, conn: DBConn, rate_bps: int) -> dict[str, Any]:
         rate_bps = int(rate_bps)
         def_id = 200000 + rate_bps
-        asset = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                TICKET_ASSET_TYPE,
-                def_id,
-            )
-        )
-        if asset:
-            return asset
         tenths_text = _discount_tenths_text(rate_bps)
         name = "免费券" if rate_bps == 0 else f"{tenths_text}折优惠券"
-        created = await conn.execute(
-            'INSERT INTO "Asset" ("assetId",type,name,description,"billingEffect",valid) VALUES (?,?,?,?,?,1)',
+        return await self._ensure_asset_definition(
+            conn,
             def_id,
             TICKET_ASSET_TYPE,
             name,
             f"管理员发放的{name}",
-            json.dumps(
-                {
-                    "type": "RATE",
-                    "rateBps": rate_bps,
-                    "priority": 50,
-                    "stackable": False,
-                    "consume": False,
-                    "condition": {},
-                }
-            ),
+            {
+                "type": "RATE",
+                "rateBps": rate_bps,
+                "priority": 50,
+                "stackable": False,
+                "consume": False,
+                "condition": {},
+            },
         )
-        return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
 
     async def deduct_wallet(self, uid: str, amount_cents: int, comment: str, conn: DBConn) -> None:
         wallet = await self.wallet(uid, True, conn)
@@ -1562,7 +1621,7 @@ class ShinjukuService:
         owns_conn = conn is None
         if owns_conn:
             async with self._acquire() as acquired:
-                async with acquired.transaction():
+                async with acquired.transaction(immediate=True):
                     return await self.upsert_present_by_id(uid, present_id, acquired)
         user = await self.find_user(uid, conn)
         if not user:
@@ -1576,7 +1635,7 @@ class ShinjukuService:
         owns_conn = conn is None
         if owns_conn:
             async with self._acquire() as acquired:
-                async with acquired.transaction():
+                async with acquired.transaction(immediate=True):
                     return await self.redeem(uid, code, acquired)
 
         user = await self.find_user(uid, conn)
@@ -1614,7 +1673,7 @@ class ShinjukuService:
     async def create_gift_code(self, present_id: int, currency_amount_cents: int, max_use_count: int) -> dict[str, Any]:
         """基于现有礼包生成兑换码：货币数量按参数覆盖，每人限领一次，总数封顶 max_use_count。"""
         async with self._acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(immediate=True):
                 present = _row(await conn.fetchrow('SELECT * FROM "Present" WHERE id=?', present_id))
                 if not present:
                     raise ShinjukuError("礼包不存在。", "ASSET_NOT_FOUND")
@@ -1730,23 +1789,13 @@ class ShinjukuService:
         if asset_type == CURRENCY_ASSET_TYPE and asset_id == PAID_CURRENCY_ASSET_ID:
             return await self.ensure_currency_asset(conn)
         if asset_type == CURRENCY_ASSET_TYPE and asset_id == FREE_CURRENCY_ASSET_ID:
-            asset = _row(
-                await conn.fetchrow(
-                    'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                    CURRENCY_ASSET_TYPE,
-                    FREE_CURRENCY_ASSET_ID,
-                )
-            )
-            if asset:
-                return asset
-            created = await conn.execute(
-                'INSERT INTO "Asset" ("assetId",type,name,description,valid) VALUES (?,?,?,?,1)',
+            return await self._ensure_asset_definition(
+                conn,
                 FREE_CURRENCY_ASSET_ID,
                 CURRENCY_ASSET_TYPE,
                 f"{self.currency}（免费）",
                 "新宿插件自动创建的免费货币资产定义",
             )
-            return _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', created.lastrowid))
         if asset_type == PASS_ASSET_TYPE and asset_id == MONTHLY_PASS_ASSET_ID:
             return await self.ensure_pass_asset(conn)
         return None
