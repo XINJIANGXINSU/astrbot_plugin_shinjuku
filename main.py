@@ -351,6 +351,10 @@ class ShinjukuPlugin(Star):
         points_per_amount = int(points_per_amount_value if points_per_amount_value is not None else 10)
         max_active_checkcodes = int(config.get("max_active_checkcodes") or 20)
         self_open_door_enabled = bool(config.get("self_open_door_enabled") is not False)
+        try:
+            self_open_door_points_threshold = int(config.get("self_open_door_points_threshold", 10))
+        except (TypeError, ValueError):
+            self_open_door_points_threshold = 10
         login_grace_minutes = int(config.get("login_grace_minutes") or 3)
         sneak_login_enabled = bool(config.get("sneak_login_enabled") is True)
         try:
@@ -358,6 +362,7 @@ class ShinjukuPlugin(Star):
         except (TypeError, ValueError):
             sneak_login_points_threshold = 10
         self.self_open_door_enabled = self_open_door_enabled
+        self.self_open_door_points_threshold = max(0, self_open_door_points_threshold)
         self.sneak_login_enabled = sneak_login_enabled
         self.sneak_login_points_threshold = max(0, sneak_login_points_threshold)
         self.service = ShinjukuService(
@@ -672,11 +677,16 @@ class ShinjukuPlugin(Star):
         async def run():
             uid = self._target_from_optional_arg(event)
             prefix = await self._ensure_registered(uid)
-            login_result = await self.service.login(uid)
+            can_self_open_door = False
+            if self.self_open_door_enabled:
+                wallet = await self.service.wallet(uid)
+                points = float(wallet["points"]["available"] or 0)
+                can_self_open_door = points > self.self_open_door_points_threshold
+            login_result = await self.service.login(uid, generate_checkcode=can_self_open_door)
             session = login_result["session"]
             over_capacity = bool(login_result.get("overCapacity"))
-            if self.self_open_door_enabled and uid == sender_uid:
-                checkcode = session.get("CHECKCODE") or ""
+            checkcode = session.get("CHECKCODE") or ""
+            if self.self_open_door_enabled and uid == sender_uid and checkcode:
                 components: list[Any] = []
                 if prefix:
                     components.append(Plain(prefix))
@@ -685,7 +695,7 @@ class ShinjukuPlugin(Star):
                 if over_capacity:
                     components.append(Plain("\nwoc，音趴！"))
                 return components
-            if self.self_open_door_enabled:
+            if self.self_open_door_enabled and checkcode:
                 msg = prefix + "✅ 入场成功"
             else:
                 if self._is_admin(event):
@@ -727,18 +737,26 @@ class ShinjukuPlugin(Star):
                     f"（积分需高于 {self.sneak_login_points_threshold}）"
                     "条件不满足，禁止偷偷上机"
                 )
-            login_result = await self.service.login(uid, "sneak")
+            can_self_open_door = (
+                self.self_open_door_enabled
+                and points > self.self_open_door_points_threshold
+            )
+            login_result = await self.service.login(
+                uid,
+                "sneak",
+                generate_checkcode=can_self_open_door,
+            )
             session = login_result["session"]
             over_capacity = bool(login_result.get("overCapacity"))
-            if self.self_open_door_enabled and uid == sender_uid:
-                checkcode = session.get("CHECKCODE") or ""
+            checkcode = session.get("CHECKCODE") or ""
+            if self.self_open_door_enabled and uid == sender_uid and checkcode:
                 components: list[Any] = []
                 components.append(Plain("未知玩家"))
                 components.append(Plain(f" ✅ 入场成功，验证码：'{checkcode}'"))
                 if over_capacity:
                     components.append(Plain("\nwoc，音趴！"))
                 return components
-            if self.self_open_door_enabled:
+            if self.self_open_door_enabled and checkcode:
                 msg = "✅ 入场成功"
             else:
                 if self._is_admin(event):
@@ -1063,6 +1081,15 @@ class ShinjukuPlugin(Star):
         async def run():
             if not self.self_open_door_enabled:
                 return "请联系管理员开门！"
+            uid = self._sender_uid(event)
+            if await self.service.find_user(uid):
+                wallet = await self.service.wallet(uid)
+                points = float(wallet["points"]["available"] or 0)
+                if points <= self.self_open_door_points_threshold:
+                    return (
+                        f"（积分需高于 {self.self_open_door_points_threshold}）"
+                        "条件不满足，无法自助开门，请联系管理员开门"
+                    )
             raw = (event.message_str or "").strip()
             text = raw.lstrip("/")
             m = re.match(r"^开门\s*(\d{7})\s*$", text)
@@ -1073,7 +1100,7 @@ class ShinjukuPlugin(Star):
                     if re.fullmatch(r"\d{7}", arg):
                         code = arg
                         break
-            status = await self.service.door_verify(self._sender_uid(event), code)
+            status = await self.service.door_verify(uid, code)
             if status == "SUCCESS_FIRST":
                 return "门已开，祝您游玩愉快！"
             if status == "SUCCESS_AGAIN":
