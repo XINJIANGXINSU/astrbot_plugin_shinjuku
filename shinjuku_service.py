@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
-import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, AsyncIterator
 
 try:
@@ -25,6 +23,7 @@ try:
         TICKET_ASSET_TYPE,
     )
     from .errors import ShinjukuError
+    from .migrations import DatabaseMigrator
     from .money import (
         MONEY_SCALE,
         RATE_SCALE,
@@ -34,7 +33,6 @@ try:
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
-    from .schema import SCHEMA_SQL
     from .storage import (
         DBConn,
         SQLitePool,
@@ -58,6 +56,7 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         TICKET_ASSET_TYPE,
     )
     from errors import ShinjukuError
+    from migrations import DatabaseMigrator
     from money import (
         MONEY_SCALE,
         RATE_SCALE,
@@ -67,7 +66,6 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
-    from schema import SCHEMA_SQL
     from storage import (
         DBConn,
         SQLitePool,
@@ -124,6 +122,7 @@ class ShinjukuService:
         self.self_open_door_enabled = bool(self_open_door_enabled)
         self.login_grace_minutes = max(0, int(login_grace_minutes or 0))
         self.storage = SQLitePool(db_path)
+        self.migrations = DatabaseMigrator()
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -140,255 +139,7 @@ class ShinjukuService:
             yield conn
 
     async def _init_schema(self, conn: DBConn) -> None:
-        await conn._conn.executescript(SCHEMA_SQL)
-        try:
-            await conn._conn.execute('ALTER TABLE "Session" ADD COLUMN "CHECKCODE" TEXT')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            await conn._conn.execute('ALTER TABLE "Session" ADD COLUMN "doorOpened" INTEGER NOT NULL DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            await conn._conn.execute('ALTER TABLE "Session" ADD COLUMN "ENTRY_TYPE" TEXT NOT NULL DEFAULT \'normal\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            await conn._conn.execute('CREATE INDEX IF NOT EXISTS idx_session_checkcode ON "Session"("CHECKCODE")')
-        except sqlite3.OperationalError:
-            pass
-        await self._migrate_money_to_integer_cents(conn)
-        await self._ensure_identity_session_constraints(conn)
-        await self._ensure_asset_redeem_constraints(conn)
-
-    async def _ensure_asset_redeem_constraints(self, conn: DBConn) -> None:
-        """确保资产定义、兑换码和一次性礼包领取由数据库强制约束。"""
-        raw = conn._conn
-        await raw.execute("BEGIN IMMEDIATE")
-        try:
-            duplicate_asset = await (
-                await raw.execute(
-                    'SELECT type,"assetId",count(*) FROM "Asset" '
-                    'GROUP BY type,"assetId" HAVING count(*)>1 LIMIT 1'
-                )
-            ).fetchone()
-            if duplicate_asset:
-                raise ShinjukuError(
-                    f"数据库存在重复资产定义：{duplicate_asset[0]}:{duplicate_asset[1]}，请先合并重复数据。",
-                    "DUPLICATE_ASSET_DEFINITION_DATA",
-                )
-
-            duplicate_code = await (
-                await raw.execute(
-                    'SELECT code,count(*) FROM "Redeem" GROUP BY code HAVING count(*)>1 LIMIT 1'
-                )
-            ).fetchone()
-            if duplicate_code:
-                raise ShinjukuError(
-                    f"数据库存在重复兑换码：{duplicate_code[0]}，请先处理重复数据。",
-                    "DUPLICATE_REDEEM_CODE_DATA",
-                )
-
-            duplicate_once = await (
-                await raw.execute(
-                    'SELECT rr."userId",rr."presentId",count(*) FROM "RedeemRecord" rr '
-                    'JOIN "Present" p ON p.id=rr."presentId" WHERE p."oncePerUser"=1 '
-                    'GROUP BY rr."userId",rr."presentId" HAVING count(*)>1 LIMIT 1'
-                )
-            ).fetchone()
-            if duplicate_once:
-                raise ShinjukuError(
-                    f"用户 #{duplicate_once[0]} 已重复领取一次性礼包 #{duplicate_once[1]}，请先处理重复记录。",
-                    "DUPLICATE_ONCE_PRESENT_DATA",
-                )
-
-            await raw.execute(
-                'CREATE UNIQUE INDEX IF NOT EXISTS uq_asset_type_asset_id ON "Asset"(type,"assetId")'
-            )
-            await raw.execute(
-                'CREATE UNIQUE INDEX IF NOT EXISTS uq_redeem_code ON "Redeem"(code)'
-            )
-            await raw.execute(
-                '''CREATE TRIGGER IF NOT EXISTS trg_once_present_redeem_unique
-                   BEFORE INSERT ON "RedeemRecord"
-                   WHEN EXISTS (
-                       SELECT 1 FROM "Present" p
-                       WHERE p.id=NEW."presentId" AND p."oncePerUser"=1
-                   ) AND EXISTS (
-                       SELECT 1 FROM "RedeemRecord" rr
-                       WHERE rr."userId"=NEW."userId" AND rr."presentId"=NEW."presentId"
-                   )
-                   BEGIN
-                       SELECT RAISE(ABORT, 'once-per-user present already redeemed');
-                   END'''
-            )
-            await raw.execute(
-                'INSERT OR IGNORE INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
-                (ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY, _now().isoformat()),
-            )
-            await raw.commit()
-        except BaseException:
-            await raw.rollback()
-            raise
-
-    async def _ensure_identity_session_constraints(self, conn: DBConn) -> None:
-        """确保 QQ 绑定、活跃会话和单次会话验证码由数据库强制约束。"""
-        raw = conn._conn
-        await raw.execute("BEGIN IMMEDIATE")
-        try:
-            duplicate_bind = await (
-                await raw.execute(
-                    'SELECT type,bid,count(*) FROM "Bind" GROUP BY type,bid HAVING count(*)>1 LIMIT 1'
-                )
-            ).fetchone()
-            if duplicate_bind:
-                raise ShinjukuError(
-                    f"数据库存在重复绑定：{duplicate_bind[0]}:{duplicate_bind[1]}，请先合并重复用户数据。",
-                    "DUPLICATE_BIND_DATA",
-                )
-
-            duplicate_session = await (
-                await raw.execute(
-                    'SELECT "userId",count(*) FROM "Session" WHERE "isActive"=1 '
-                    'GROUP BY "userId" HAVING count(*)>1 LIMIT 1'
-                )
-            ).fetchone()
-            if duplicate_session:
-                raise ShinjukuError(
-                    f"用户 #{duplicate_session[0]} 存在多个活跃会话，请先处理重复上机记录。",
-                    "DUPLICATE_ACTIVE_SESSION_DATA",
-                )
-
-            await raw.execute(
-                'CREATE UNIQUE INDEX IF NOT EXISTS uq_bind_type_bid ON "Bind"(type,bid)'
-            )
-            await raw.execute(
-                'CREATE UNIQUE INDEX IF NOT EXISTS uq_session_active_user ON "Session"("userId") '
-                'WHERE "isActive"=1'
-            )
-            await raw.execute(
-                '''CREATE TRIGGER IF NOT EXISTS trg_active_session_checkcode_immutable
-                   BEFORE UPDATE OF "CHECKCODE" ON "Session"
-                   WHEN OLD."isActive"=1 AND OLD."CHECKCODE" IS NOT NEW."CHECKCODE"
-                   BEGIN
-                       SELECT RAISE(ABORT, 'active session checkcode is immutable');
-                   END'''
-            )
-            await raw.execute(
-                'INSERT OR IGNORE INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
-                (IDENTITY_CONSTRAINTS_MIGRATION_KEY, _now().isoformat()),
-            )
-            await raw.commit()
-        except BaseException:
-            await raw.rollback()
-            raise
-
-    async def _migrate_money_to_integer_cents(self, conn: DBConn) -> None:
-        """一次性把旧库中的元/浮点金额迁移为分/整数金额。"""
-        applied = await conn.fetchval('SELECT 1 FROM "SchemaMigration" WHERE key=?', MONEY_MIGRATION_KEY)
-        if applied:
-            return
-
-        raw = conn._conn
-        await raw.execute("BEGIN IMMEDIATE")
-        try:
-            # UserAsset.count 同时存放货币和非货币数量；仅货币乘 100，其他资产取整。
-            await raw.execute("DROP INDEX IF EXISTS idx_userasset_user")
-            await raw.execute('ALTER TABLE "UserAsset" RENAME TO "UserAsset_money_legacy"')
-            await raw.execute(
-                '''CREATE TABLE "UserAsset" (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    "userId" INTEGER NOT NULL REFERENCES "User"(id),
-                    "assetDefId" INTEGER NOT NULL,
-                    "assetType" TEXT NOT NULL,
-                    "assetId" INTEGER REFERENCES "Asset"(id),
-                    count INTEGER NOT NULL DEFAULT 0,
-                    "activeAt" TEXT,
-                    "expireAt" TEXT
-                )'''
-            )
-            await raw.execute(
-                '''INSERT INTO "UserAsset"
-                   (id,"userId","assetDefId","assetType","assetId",count,"activeAt","expireAt")
-                   SELECT id,"userId","assetDefId","assetType","assetId",
-                          CASE WHEN "assetType"=? THEN CAST(ROUND(count * ?) AS INTEGER)
-                               ELSE CAST(ROUND(count) AS INTEGER) END,
-                          "activeAt","expireAt"
-                   FROM "UserAsset_money_legacy"''',
-                (CURRENCY_ASSET_TYPE, MONEY_SCALE),
-            )
-            await raw.execute('DROP TABLE "UserAsset_money_legacy"')
-            await raw.execute('CREATE INDEX idx_userasset_user ON "UserAsset"("userId", "assetType")')
-
-            await raw.execute(
-                'UPDATE "Session" SET "billingCost"=CAST(ROUND("billingCost" * ?) AS INTEGER) '
-                'WHERE "billingCost" IS NOT NULL',
-                (MONEY_SCALE,),
-            )
-            await raw.execute(
-                'UPDATE "Session" SET "finalCost"=CAST(ROUND("finalCost" * ?) AS INTEGER) '
-                'WHERE "finalCost" IS NOT NULL',
-                (MONEY_SCALE,),
-            )
-            session_columns = {
-                row[1] for row in await (await raw.execute('PRAGMA table_info("Session")')).fetchall()
-            }
-            if "costOverwrite" in session_columns:
-                await raw.execute(
-                    'UPDATE "Session" SET "costOverwrite"=CAST(ROUND("costOverwrite" * ?) AS INTEGER) '
-                    'WHERE "costOverwrite" IS NOT NULL',
-                    (MONEY_SCALE,),
-                )
-            await raw.execute(
-                'UPDATE "UserAssetLog" SET '
-                '"changeAmount"=CAST(ROUND("changeAmount" * ?) AS INTEGER), '
-                '"countBefore"=CAST(ROUND("countBefore" * ?) AS INTEGER), '
-                '"countAfter"=CAST(ROUND("countAfter" * ?) AS INTEGER) '
-                'WHERE "assetType"=?',
-                (MONEY_SCALE, MONEY_SCALE, MONEY_SCALE, CURRENCY_ASSET_TYPE),
-            )
-
-            present_rows = await (await raw.execute('SELECT id, body FROM "Present" WHERE body IS NOT NULL')).fetchall()
-            for present_id, body_text in present_rows:
-                body = _json(body_text) or []
-                changed = False
-                for item in body:
-                    if str(item.get("assetType")) == CURRENCY_ASSET_TYPE and "count" in item:
-                        item["count"] = amount_to_cents(item["count"])
-                        changed = True
-                if changed:
-                    await raw.execute(
-                        'UPDATE "Present" SET body=? WHERE id=?',
-                        (json.dumps(body, ensure_ascii=False), present_id),
-                    )
-
-            effect_rows = await (
-                await raw.execute(
-                    'SELECT id, "billingEffect" FROM "Asset" WHERE type=? AND "billingEffect" IS NOT NULL',
-                    (TICKET_ASSET_TYPE,),
-                )
-            ).fetchall()
-            for asset_id, effect_text in effect_rows:
-                effect = _json(effect_text) or {}
-                if effect.get("type") != "RATE" or "rateBps" in effect:
-                    continue
-                rate = Decimal(str(effect.pop("value", 1)))
-                effect["rateBps"] = int(
-                    (rate * RATE_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-                )
-                await raw.execute(
-                    'UPDATE "Asset" SET "billingEffect"=? WHERE id=?',
-                    (json.dumps(effect, ensure_ascii=False), asset_id),
-                )
-
-            await raw.execute(
-                'INSERT INTO "SchemaMigration" (key,"appliedAt") VALUES (?,?)',
-                (MONEY_MIGRATION_KEY, _now().isoformat()),
-            )
-            await raw.commit()
-        except BaseException:
-            await raw.rollback()
-            raise
+        await self.migrations.initialize(conn)
 
     async def _generate_checkcode(self, conn: DBConn) -> str:
         """生成不重复的7位数字验证码（CHECKCODE），仅在活跃会话范围内查重（离场后自动作废释放）。"""

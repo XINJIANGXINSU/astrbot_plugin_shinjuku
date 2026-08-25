@@ -14,6 +14,7 @@ astrbot_plugin_shinjuku/
 ├── billing_engine.py     # 无数据库依赖的纯计费分段与封顶计算
 ├── constants.py          # 资产标识与数据库迁移键
 ├── main.py               # 插件入口：指令注册、权限与业务编排
+├── migrations.py         # 数据库初始化、旧字段升级与约束迁移
 ├── errors.py             # 跨层共享的领域异常
 ├── money.py              # 金额、折扣的纯计算与格式转换
 ├── nickname_cache.py     # 分群昵称缓存
