@@ -25,6 +25,7 @@ from .presentation import (
     format_wallet,
     money,
 )
+from .settings import PluginSettings
 from .shinjuku_service import ShinjukuService
 
 
@@ -33,35 +34,26 @@ class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.currency = str(config.get("currency", "馕") or "馕")
         try:
             # AstrBot 官方插件数据目录：AstrBot/data/plugin_data/astrbot_plugin_shinjuku/
             default_db = str(StarTools.get_data_dir("astrbot_plugin_shinjuku") / "shinjuku.db")
         except Exception:
             # 旧版 AstrBot 无此接口时回退到插件目录
             default_db = path.join(path.dirname(path.abspath(__file__)), "data", "shinjuku.db")
-        db_path = str(config.get("database_path", "") or "") or default_db
-        points_per_amount_value = config.get("points_per_amount")
-        points_per_amount = int(points_per_amount_value if points_per_amount_value is not None else 10)
-        max_active_checkcodes = int(config.get("max_active_checkcodes") or 20)
-        self_open_door_enabled = bool(config.get("self_open_door_enabled") is not False)
-        try:
-            self_open_door_points_threshold = int(config.get("self_open_door_points_threshold", 10))
-        except (TypeError, ValueError):
-            self_open_door_points_threshold = 10
-        login_grace_minutes = int(config.get("login_grace_minutes") or 3)
-        sneak_login_enabled = bool(config.get("sneak_login_enabled") is True)
-        try:
-            sneak_login_points_threshold = int(config.get("sneak_login_points_threshold", 10))
-        except (TypeError, ValueError):
-            sneak_login_points_threshold = 10
-        self.self_open_door_enabled = self_open_door_enabled
-        self.self_open_door_points_threshold = max(0, self_open_door_points_threshold)
-        self.sneak_login_enabled = sneak_login_enabled
-        self.sneak_login_points_threshold = max(0, sneak_login_points_threshold)
+        self.settings = PluginSettings.from_config(config, default_db)
+        self.currency = self.settings.currency
+        self.self_open_door_enabled = self.settings.self_open_door_enabled
+        self.self_open_door_points_threshold = self.settings.self_open_door_points_threshold
+        self.sneak_login_enabled = self.settings.sneak_login_enabled
+        self.sneak_login_points_threshold = self.settings.sneak_login_points_threshold
         self.service = ShinjukuService(
-            db_path, self.currency, config.get("billing", {}) or {}, points_per_amount, max_active_checkcodes,
-            self_open_door_enabled, login_grace_minutes,
+            self.settings.database_path,
+            self.currency,
+            self.settings.billing,
+            self.settings.points_per_amount,
+            self.settings.max_active_checkcodes,
+            self.settings.self_open_door_enabled,
+            self.settings.login_grace_minutes,
         )
         self.nicknames = NicknameCache()
 
@@ -151,7 +143,7 @@ class ShinjukuPlugin(Star):
                     return
 
     def _admins(self) -> set[str]:
-        return {str(item) for item in (self.config.get("admins", []) or [])}
+        return set(self.settings.admins)
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         return self._sender_real_qq(event) in self._admins()
@@ -252,7 +244,7 @@ class ShinjukuPlugin(Star):
         if await self.service.find_user(uid):
             return ""
         qq = self._qq_from_uid(uid)
-        register_code = str(self.config.get("redeem_code_on_register", "") or "")
+        register_code = self.settings.redeem_code_on_register
         result = await self.service.register(qq, register_code)
         label = user_label or qq
         if result["created"]:
@@ -367,7 +359,7 @@ class ShinjukuPlugin(Star):
                 qq = uid.split(":", 1)[1]
             else:
                 qq = self._sender_real_qq(event)
-            register_code = str(self.config.get("redeem_code_on_register", "") or "")
+            register_code = self.settings.redeem_code_on_register
             result = await self.service.register(qq, register_code)
             if result["created"]:
                 message = f"注册成功，用户 ID：{result['user']['id']}"
