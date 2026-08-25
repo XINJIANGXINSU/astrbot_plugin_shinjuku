@@ -3,6 +3,7 @@ from pathlib import Path
 
 from asset_service import AssetService
 from present_service import PresentService
+from session_service import SessionService
 from shinjuku_service import ShinjukuService
 from user_service import UserService
 from wallet_service import WalletService
@@ -15,6 +16,7 @@ def test_service_composes_asset_and_wallet_collaborators(tmp_path):
     assert isinstance(service.assets, AssetService)
     assert isinstance(service.wallets, WalletService)
     assert isinstance(service.presents, PresentService)
+    assert isinstance(service.sessions, SessionService)
 
 
 def test_collaborators_do_not_depend_on_facade_or_own_transactions():
@@ -25,6 +27,7 @@ def test_collaborators_do_not_depend_on_facade_or_own_transactions():
         "asset_service.py",
         "wallet_service.py",
         "present_service.py",
+        "session_service.py",
     ):
         source = (root / name).read_text(encoding="utf-8")
         assert "shinjuku_service" not in source

@@ -26,6 +26,7 @@ astrbot_plugin_shinjuku/
 ├── schema.py             # 新数据库的标准 SQLite Schema
 ├── settings.py           # 插件配置默认值、类型转换与范围归一化
 ├── shinjuku_service.py   # 业务门面：用户、会话、结算与兑换编排
+├── session_service.py    # 入场、开门、强退与在场会话查询
 ├── storage.py            # SQLite 行转换、事务包装与连接池
 ├── tests/                # 计费、并发、迁移与展示层测试
 ├── user_service.py       # 用户、平台绑定与联动资料查询

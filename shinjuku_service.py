@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
@@ -34,6 +32,7 @@ try:
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
     from .present_service import PresentService
+    from .session_service import SessionService
     from .storage import (
         DBConn,
         SQLitePool,
@@ -71,6 +70,7 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
     from present_service import PresentService
+    from session_service import SessionService
     from storage import (
         DBConn,
         SQLitePool,
@@ -111,6 +111,14 @@ class ShinjukuService:
         self.assets = AssetService(self.currency, self.users.find_user, lambda: _now())
         self.wallets = WalletService(self.assets, self.users.find_user, lambda: _now())
         self.presents = PresentService(self.assets, self.users.find_user, lambda: _now())
+        self.sessions = SessionService(
+            self.users,
+            self.wallets,
+            self.currency,
+            self.max_active_checkcodes,
+            self.self_open_door_enabled,
+            lambda: _now(),
+        )
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -130,18 +138,10 @@ class ShinjukuService:
         await self.migrations.initialize(conn)
 
     async def _generate_checkcode(self, conn: DBConn) -> str:
-        """生成不重复的7位数字验证码（CHECKCODE），仅在活跃会话范围内查重（离场后自动作废释放）。"""
-        while True:
-            code = f"{secrets.randbelow(9000000) + 1000000:07d}"
-            exists = await conn.fetchval(
-                'SELECT 1 FROM "Session" WHERE "CHECKCODE"=? AND "isActive"=1 LIMIT 1',
-                code,
-            )
-            if not exists:
-                return code
+        return await self.sessions.generate_checkcode(conn)
 
     async def _active_session_count(self, conn: DBConn) -> int:
-        return int(await conn.fetchval('SELECT count(*) FROM "Session" WHERE "isActive"=1') or 0)
+        return await self.sessions.active_session_count(conn)
 
     def calculate_billing(
         self,
@@ -195,33 +195,12 @@ class ShinjukuService:
     ) -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                user = await self.find_user(uid, conn)
-                if not user:
-                    raise ShinjukuError("用户不存在，请先注册。", "USER_NOT_FOUND")
-                if await self.active_session(uid, conn):
-                    raise ShinjukuError("用户已经登录。", "USER_ALREADY_LOGGED_IN")
-                wallet = await self.wallet(uid, False, conn)
-                if wallet["total"]["available"] < 0:
-                    debt = -wallet["total"]["available"]
-                    raise ShinjukuError(
-                        f"当前欠费 {cents_to_text(debt)} {self.currency}，请先充值后再入场。",
-                        "INSUFFICIENT_BALANCE_FOR_LOGIN",
-                    )
-                if self.self_open_door_enabled and generate_checkcode:
-                    checkcode = await self._generate_checkcode(conn)
-                else:
-                    checkcode = None
-                created = await conn.execute(
-                    'INSERT INTO "Session" ("userId", "createdAt", "isActive", "CHECKCODE", "ENTRY_TYPE") VALUES (?, ?, 1, ?, ?)',
-                    user["id"],
-                    _now(),
-                    checkcode,
+                return await self.sessions.login(
+                    uid,
                     entry_type,
+                    generate_checkcode,
+                    conn,
                 )
-                session = _row(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', created.lastrowid))
-                active_count = await self._active_session_count(conn)
-                over_capacity = active_count > self.max_active_checkcodes
-                return {"session": session, "overCapacity": over_capacity, "activeCount": active_count}
 
     async def door_verify(self, sender_uid: str, code_str: str | None) -> str:
         """自助开门校验。返回状态：
@@ -235,37 +214,7 @@ class ShinjukuService:
         """
         async with self._acquire() as conn:
             async with conn.transaction():
-                sender_user = await self.find_user(sender_uid, conn)
-                sender_active_session = None
-                if sender_user:
-                    sender_active_session = await self.active_session(sender_uid, conn)
-                if code_str is None:
-                    if sender_active_session:
-                        return "NO_CODE_PRESENT"
-                    return "NO_CODE_OFFLINE"
-                code_norm = str(code_str).strip()
-                code_owner_session = None
-                if code_norm and re.fullmatch(r"\d{7}", code_norm):
-                    code_owner_row = await conn.fetchrow(
-                        'SELECT * FROM "Session" WHERE "CHECKCODE"=? AND "isActive"=1 LIMIT 1',
-                        code_norm,
-                    )
-                    code_owner_session = _row(code_owner_row) if code_owner_row else None
-                if sender_active_session:
-                    my_code = sender_active_session.get("CHECKCODE") or ""
-                    if my_code and code_norm and code_norm == my_code:
-                        opened = int(sender_active_session.get("doorOpened") or 0)
-                        if not opened:
-                            await conn.execute(
-                                'UPDATE "Session" SET "doorOpened"=1 WHERE id=?',
-                                sender_active_session["id"],
-                            )
-                            return "SUCCESS_FIRST"
-                        return "SUCCESS_AGAIN"
-                    return "WRONG_CODE"
-                if code_owner_session:
-                    return "STOLEN_CODE"
-                return "NOT_PRESENT"
+                return await self.sessions.door_verify(sender_uid, code_str, conn)
 
     async def logout(self, uid: str) -> dict[str, Any]:
         async with self._acquire() as conn:
@@ -352,16 +301,7 @@ class ShinjukuService:
         """管理员强制退场：直接关闭会话，不做结算、不发积分。"""
         async with self._acquire() as conn:
             async with conn.transaction():
-                session = await self.active_session(uid, conn)
-                if not session:
-                    raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
-                await conn.execute(
-                    'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, "billingCost"=0, "finalCost"=0 WHERE id=?',
-                    _now(),
-                    session["id"],
-                )
-                closed = _row(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', session["id"]))
-                return {"session": closed}
+                return await self.sessions.force_logout(uid, conn)
 
     async def billing(self, uid: str, conn: DBConn | None = None) -> dict[str, Any]:
         owns_conn = conn is None
@@ -499,42 +439,19 @@ class ShinjukuService:
 
     async def history(self, uid: str, limit: int = 5) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
-            user = await self.find_user(uid, conn)
-            if not user:
-                raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-            return _rows(
-                await conn.fetch(
-                    'SELECT * FROM "Session" WHERE "userId"=? ORDER BY "createdAt" DESC LIMIT ?',
-                    user["id"],
-                    limit,
-                )
-            )
+            return await self.sessions.history(uid, limit, conn)
 
     async def active_session(self, uid: str, conn: DBConn) -> dict[str, Any] | None:
-        user = await self.find_user(uid, conn)
-        if not user:
-            return None
-        return _row(await conn.fetchrow('SELECT * FROM "Session" WHERE "userId"=? AND "isActive"=1 LIMIT 1', user["id"]))
+        return await self.sessions.active_session(uid, conn)
 
     async def is_sneak_active(self, uid: str) -> bool:
         """用户当前是否处于偷偷上机会话（ENTRY_TYPE=sneak 且 isActive=1）。"""
         async with self._acquire() as conn:
-            session = await self.active_session(uid, conn)
-            return bool(session and session.get("ENTRY_TYPE") == "sneak")
+            return await self.sessions.is_sneak_active(uid, conn)
 
     async def logged_in_users(self) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
-            users = _rows(
-                await conn.fetch(
-                    'SELECT DISTINCT u.* FROM "User" u JOIN "Session" s ON s."userId"=u.id WHERE s."isActive"=1 ORDER BY u.id'
-                )
-            )
-            for user in users:
-                user["binds"] = _rows(await conn.fetch('SELECT * FROM "Bind" WHERE "userId"=?', user["id"]))
-                user["sessions"] = _rows(
-                    await conn.fetch('SELECT * FROM "Session" WHERE "userId"=? AND "isActive"=1', user["id"])
-                )
-            return users
+            return await self.sessions.logged_in_users(conn)
 
     async def wallet(self, uid: str, details: bool = False, conn: DBConn | None = None) -> dict[str, Any]:
         if conn is None:
