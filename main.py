@@ -14,6 +14,7 @@ from .errors import ShinjukuError
 from .event_adapter import EventAdapter
 from .money import amount_to_cents
 from .nickname_cache import NicknameCache
+from .onebot_adapter import OneBotAdapter
 from .presentation import (
     date_time,
     format_billing,
@@ -57,6 +58,7 @@ class ShinjukuPlugin(Star):
         )
         self.nicknames = NicknameCache()
         self.events = EventAdapter(self.nicknames)
+        self.onebot = OneBotAdapter(logger)
 
     async def terminate(self):
         await self.service.close()
@@ -124,59 +126,10 @@ class ShinjukuPlugin(Star):
         return label
 
     async def _call_onebot_action(self, client: Any, action: str, **kwargs: Any) -> Any:
-        """调用 OneBot API，兼容不同版本 AstrBot / aiocqhttp 的客户端接口。"""
-        call_action = getattr(client, "call_action", None)
-        if callable(call_action):
-            try:
-                return await call_action(action, **kwargs)
-            except AttributeError:
-                pass
-        api = getattr(client, "api", None)
-        if api is not None:
-            api_call = getattr(api, "call_action", None)
-            if callable(api_call):
-                return await api_call(action, **kwargs)
-            api_action = getattr(api, action, None)
-            if callable(api_action):
-                return await api_action(**kwargs)
-        client_action = getattr(client, action, None)
-        if callable(client_action):
-            return await client_action(**kwargs)
-        raise AttributeError(f"OneBot client 不支持 {action} API")
+        return await self.onebot.call_action(client, action, **kwargs)
 
     async def _recall_onebot_message(self, event: AstrMessageEvent) -> None:
-        """通过 OneBot API 撤回玩家发送的偷偷上机指令消息；失败仅记录日志，不影响原有功能。"""
-        try:
-            platform_name = event.get_platform_name()
-        except Exception:
-            platform_name = getattr(getattr(event, "platform_meta", None), "name", "") or ""
-        if platform_name != "aiocqhttp":
-            return
-        try:
-            message_id = getattr(event.message_obj, "message_id", None)
-            if not message_id:
-                return
-            client = getattr(event, "bot", None)
-            if client is None:
-                return
-            candidates: list[Any] = []
-            try:
-                candidates.append(int(message_id))
-            except (TypeError, ValueError):
-                pass
-            candidates.append(str(message_id))
-            last_error: Exception | None = None
-            for candidate in candidates:
-                try:
-                    await self._call_onebot_action(client, "delete_msg", message_id=candidate)
-                    logger.info(f"新宿：已撤回偷偷上机指令消息 {message_id}")
-                    return
-                except Exception as exc:
-                    last_error = exc
-                    logger.debug(f"新宿撤回指令消息失败（{candidate}）: {exc}")
-            logger.error(f"新宿：撤回偷偷上机指令消息失败: {last_error}")
-        except Exception as exc:
-            logger.error(f"新宿：撤回偷偷上机指令消息失败: {exc}")
+        await self.onebot.recall_message(event)
 
     def _target_from_optional_arg(self, event: AstrMessageEvent) -> str:
         self._remember_sender_name(event)
