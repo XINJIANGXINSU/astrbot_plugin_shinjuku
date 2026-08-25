@@ -3,7 +3,7 @@
 基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的原生上机计费插件，用于新宿音游窝的会员、入场、计费与结算。数据使用 **SQLite 本地存储**
 - 插件名：`astrbot_plugin_shinjuku`
 - 显示名：新宿
-- 版本：v0.3.4
+- 版本：v0.4.0
 - 最低 AstrBot 版本：>= 4.16
 
 --若有音游窝计费需求，请在使用前联系作者（新宿音游社 QQ 群：1064813917），以便作者了解使用情况、提供后续更新与支持。
@@ -11,8 +11,28 @@
 
 ```
 astrbot_plugin_shinjuku/
-├── main.py               # 插件入口：指令注册、权限、消息格式化
-├── shinjuku_service.py   # 业务层：SQLite 存取、计费引擎、欠费、兑换码
+├── asset_service.py      # 资产定义、用户资产与资产变更日志
+├── billing_engine.py     # 无数据库依赖的纯计费分段与封顶计算
+├── billing_service.py    # 账单预览、优惠选择与退场结算
+├── CHANGELOG.md          # AstrBot 插件详情页使用的版本更新日志
+├── constants.py          # 资产标识与数据库迁移键
+├── main.py               # 插件入口：指令注册、权限与业务编排
+├── migrations.py         # 数据库初始化、旧字段升级与约束迁移
+├── errors.py             # 跨层共享的领域异常
+├── event_adapter.py      # AstrBot 事件、用户目标与昵称解析
+├── money.py              # 金额、折扣的纯计算与格式转换
+├── nickname_cache.py     # 分群昵称缓存
+├── onebot_adapter.py     # OneBot API 兼容调用与消息撤回
+├── present_service.py    # 礼包、兑换码与兑换记录业务
+├── presentation/         # 无副作用的消息展示层
+├── schema.py             # 新数据库的标准 SQLite Schema
+├── settings.py           # 插件配置默认值、类型转换与范围归一化
+├── shinjuku_service.py   # 业务门面：用户、会话、结算与兑换编排
+├── session_service.py    # 入场、开门、强退与在场会话查询
+├── storage.py            # SQLite 行转换、事务包装与连接池
+├── tests/                # 计费、并发、迁移与展示层测试
+├── user_service.py       # 用户、平台绑定与联动资料查询
+├── wallet_service.py     # 钱包聚合、充值、扣款与权益发放
 ├── metadata.yaml         # 插件元数据
 ├── _conf_schema.json     # 设置表单（AstrBot Web 控制台自动生成配置页）
 └── requirements.txt      # 依赖：aiosqlite

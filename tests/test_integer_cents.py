@@ -4,7 +4,9 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import shinjuku_service as service_module
-from shinjuku_service import MONEY_MIGRATION_KEY, ShinjukuService, amount_to_cents, cents_to_text
+from errors import ShinjukuError
+from money import amount_to_cents, cents_to_text
+from shinjuku_service import MONEY_MIGRATION_KEY, ShinjukuService
 
 
 def test_money_conversion_uses_decimal_half_up():
@@ -13,6 +15,12 @@ def test_money_conversion_uses_decimal_half_up():
     assert amount_to_cents("12.344") == 1234
     assert cents_to_text(1235) == "12.35"
     assert cents_to_text(-5) == "-0.05"
+
+
+def test_service_keeps_legacy_money_exports():
+    assert service_module.ShinjukuError is ShinjukuError
+    assert service_module.amount_to_cents is amount_to_cents
+    assert service_module.cents_to_text is cents_to_text
 
 
 def test_discount_and_wallet_use_integer_cents(tmp_path, monkeypatch):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import shlex
 import sqlite3
 from os import path
 from typing import Any
@@ -11,7 +10,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .errors import ShinjukuError
+from .event_adapter import EventAdapter
+from .money import amount_to_cents
 from .nickname_cache import NicknameCache
+from .onebot_adapter import OneBotAdapter
 from .presentation import (
     date_time,
     format_billing,
@@ -23,234 +26,84 @@ from .presentation import (
     format_wallet,
     money,
 )
-from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents
+from .settings import PluginSettings
+from .shinjuku_service import ShinjukuService
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.4")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.4.0")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.currency = str(config.get("currency", "馕") or "馕")
         try:
             # AstrBot 官方插件数据目录：AstrBot/data/plugin_data/astrbot_plugin_shinjuku/
             default_db = str(StarTools.get_data_dir("astrbot_plugin_shinjuku") / "shinjuku.db")
         except Exception:
             # 旧版 AstrBot 无此接口时回退到插件目录
             default_db = path.join(path.dirname(path.abspath(__file__)), "data", "shinjuku.db")
-        db_path = str(config.get("database_path", "") or "") or default_db
-        points_per_amount_value = config.get("points_per_amount")
-        points_per_amount = int(points_per_amount_value if points_per_amount_value is not None else 10)
-        max_active_checkcodes = int(config.get("max_active_checkcodes") or 20)
-        self_open_door_enabled = bool(config.get("self_open_door_enabled") is not False)
-        try:
-            self_open_door_points_threshold = int(config.get("self_open_door_points_threshold", 10))
-        except (TypeError, ValueError):
-            self_open_door_points_threshold = 10
-        login_grace_minutes = int(config.get("login_grace_minutes") or 3)
-        sneak_login_enabled = bool(config.get("sneak_login_enabled") is True)
-        try:
-            sneak_login_points_threshold = int(config.get("sneak_login_points_threshold", 10))
-        except (TypeError, ValueError):
-            sneak_login_points_threshold = 10
-        self.self_open_door_enabled = self_open_door_enabled
-        self.self_open_door_points_threshold = max(0, self_open_door_points_threshold)
-        self.sneak_login_enabled = sneak_login_enabled
-        self.sneak_login_points_threshold = max(0, sneak_login_points_threshold)
+        self.settings = PluginSettings.from_config(config, default_db)
+        self.currency = self.settings.currency
+        self.self_open_door_enabled = self.settings.self_open_door_enabled
+        self.self_open_door_points_threshold = self.settings.self_open_door_points_threshold
+        self.sneak_login_enabled = self.settings.sneak_login_enabled
+        self.sneak_login_points_threshold = self.settings.sneak_login_points_threshold
         self.service = ShinjukuService(
-            db_path, self.currency, config.get("billing", {}) or {}, points_per_amount, max_active_checkcodes,
-            self_open_door_enabled, login_grace_minutes,
+            self.settings.database_path,
+            self.currency,
+            self.settings.billing,
+            self.settings.points_per_amount,
+            self.settings.max_active_checkcodes,
+            self.settings.self_open_door_enabled,
+            self.settings.login_grace_minutes,
         )
         self.nicknames = NicknameCache()
+        self.events = EventAdapter(self.nicknames)
+        self.onebot = OneBotAdapter(logger)
 
     async def terminate(self):
         await self.service.close()
 
     def _sender_id(self, event: AstrMessageEvent) -> str:
-        return str(event.get_sender_id())
+        return self.events.sender_id(event)
 
     def _sender_real_qq(self, event: AstrMessageEvent) -> str:
-        raw = self._sender_id(event)
-        if re.fullmatch(r"\d+", raw or ""):
-            return raw
-        for holder_name in ("sender", "message_obj"):
-            holder = getattr(event, holder_name, None)
-            if not holder:
-                continue
-            for attr in ("qq", "user_id", "uin", "uid", "id"):
-                value = getattr(holder, attr, None)
-                if value is None:
-                    continue
-                text = str(value)
-                if re.fullmatch(r"\d{5,}", text):
-                    return text
-        try:
-            components = event.get_messages() or []
-        except Exception:
-            components = []
-        for component in components:
-            for attr in ("qq", "user_id", "uin", "uid", "id"):
-                value = getattr(component, attr, None)
-                if value is None:
-                    continue
-                text = str(value)
-                if re.fullmatch(r"\d{5,}", text):
-                    return text
-        for getter in ("get_sender_qq", "get_user_id", "get_sender_uin"):
-            method = getattr(event, getter, None)
-            if callable(method):
-                try:
-                    value = method()
-                except Exception:
-                    value = None
-                if value is not None:
-                    text = str(value)
-                    if re.fullmatch(r"\d{5,}", text):
-                        return text
-        return raw
+        return self.events.sender_real_qq(event)
 
     def _sender_uid(self, event: AstrMessageEvent) -> str:
-        return f"QQ:{self._sender_real_qq(event)}"
+        return self.events.sender_uid(event)
 
     def _nickname_scope(self, event: AstrMessageEvent) -> str:
-        try:
-            platform = str(event.get_platform_name() or "unknown")
-        except Exception:
-            platform = str(getattr(getattr(event, "platform_meta", None), "name", "") or "unknown")
-        try:
-            group_id = event.get_group_id()
-        except Exception:
-            group_id = None
-        if group_id is not None and str(group_id):
-            return f"{platform}:group:{group_id}"
-        return f"{platform}:private:{self._sender_real_qq(event)}"
+        return self.events.nickname_scope(event)
 
     def _remember_sender_name(self, event: AstrMessageEvent) -> None:
-        qq = self._sender_real_qq(event)
-        scope = self._nickname_scope(event)
-        for name in ("get_sender_name", "get_sender_nickname", "get_sender_display_name"):
-            method = getattr(event, name, None)
-            if callable(method):
-                try:
-                    value = method()
-                except Exception:
-                    value = None
-                if value:
-                    self.nicknames.set(scope, qq, str(value))
-                    return
-        for holder_name in ("sender", "message_obj"):
-            holder = getattr(event, holder_name, None)
-            if not holder:
-                continue
-            for attr in ("nickname", "nick", "name", "card", "display_name"):
-                value = getattr(holder, attr, None)
-                if value:
-                    self.nicknames.set(scope, qq, str(value))
-                    return
+        self.events.remember_sender_name(event)
 
     def _admins(self) -> set[str]:
-        return {str(item) for item in (self.config.get("admins", []) or [])}
+        return set(self.settings.admins)
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         return self._sender_real_qq(event) in self._admins()
 
     def _args(self, event: AstrMessageEvent) -> list[str]:
-        text = event.message_str.strip()
-        if not text:
-            return []
-        try:
-            parts = shlex.split(text)
-        except ValueError:
-            parts = text.split()
-        if not parts:
-            return []
-        command_names = {
-            "register", "login", "logout", "list", "wallet", "history", "ahistory",
-            "billing", "items", "redeem", "add", "mj", "member", "coupon", "giftcode", "j", "入场", "上机", "出场",
-            "下机", "离场", "退场", "历史记录", "账单", "b", "背包", "钱包",
-            "xsj", "新宿几", "窝几", "wj", "新宿j", "死给", "开门", "偷偷上机",
-        }
-        command = parts[0].lstrip("/")
-        command = command.split("@", 1)[0]
-        return parts[1:] if command in command_names else parts
+        return self.events.args(event)
 
     def _at_ids(self, event: AstrMessageEvent) -> list[str]:
-        ids: list[str] = []
-        try:
-            components = event.get_messages()
-        except Exception:
-            components = []
-        for component in components:
-            kind = f"{type(component).__name__} {getattr(component, 'type', '')}".lower()
-            if "at" in kind or "mention" in kind:
-                for attr in ("qq", "user_id", "target", "id"):
-                    value = getattr(component, attr, None)
-                    if value:
-                        ids.append(str(value))
-                        break
-                continue
-            # 兼容以纯文本形式发送的 CQ at 代码：[CQ:at,qq=123]
-            text = getattr(component, "text", None)
-            if text:
-                for match in re.finditer(r"\[CQ:at,qq=[\"']?(\d+)[\"']?\]", str(text)):
-                    ids.append(match.group(1))
-        return ids
+        return self.events.at_ids(event)
 
     def _at_label(self, event: AstrMessageEvent, uid: str) -> str:
-        qq = uid.split(":", 1)[1] if uid.startswith("QQ:") else uid
-        scope = self._nickname_scope(event)
-        try:
-            components = event.get_messages()
-        except Exception:
-            components = []
-        for component in components:
-            kind = f"{type(component).__name__} {getattr(component, 'type', '')}".lower()
-            if "at" not in kind and "mention" not in kind:
-                continue
-            component_id = None
-            for attr in ("qq", "user_id", "target", "id"):
-                value = getattr(component, attr, None)
-                if value:
-                    component_id = str(value)
-                    break
-            if component_id != qq:
-                continue
-            for attr in ("name", "nickname", "nick", "display_name", "display"):
-                value = getattr(component, attr, None)
-                if value:
-                    self.nicknames.set(scope, qq, str(value))
-                    return f"{value} ({qq})"
-        remembered = self.nicknames.get(scope, qq)
-        if remembered:
-            return f"{remembered} ({qq})"
-        return qq
+        return self.events.at_label(event, uid)
 
     def _normalize_user(self, raw: str | None, event: AstrMessageEvent, allow_self: bool = True) -> str:
-        if not raw:
-            if allow_self:
-                return self._sender_uid(event)
-            raise ShinjukuError("请指定用户。")
-        if raw.startswith("QQ:"):
-            return raw
-        # AstrBot 的 @ 渲染格式为 @昵称(QQ号)，优先取括号里的真实 QQ
-        match = re.search(r"\((\d+)\)", raw)
-        if match:
-            return f"QQ:{match.group(1)}"
-        match = re.search(r"\d+", raw)
-        if match:
-            return f"QQ:{match.group(0)}"
-        raise ShinjukuError("无法识别用户，请使用 @用户 或 QQ 号。")
+        return self.events.normalize_user(raw, event, allow_self)
 
     def _qq_from_uid(self, uid: str) -> str:
-        if not uid.startswith("QQ:"):
-            raise ShinjukuError("只能自动注册 QQ 用户。")
-        return uid.split(":", 1)[1]
+        return self.events.qq_from_uid(uid)
 
     async def _ensure_registered(self, uid: str, user_label: str | None = None) -> str:
         if await self.service.find_user(uid):
             return ""
         qq = self._qq_from_uid(uid)
-        register_code = str(self.config.get("redeem_code_on_register", "") or "")
+        register_code = self.settings.redeem_code_on_register
         result = await self.service.register(qq, register_code)
         label = user_label or qq
         if result["created"]:
@@ -273,59 +126,10 @@ class ShinjukuPlugin(Star):
         return label
 
     async def _call_onebot_action(self, client: Any, action: str, **kwargs: Any) -> Any:
-        """调用 OneBot API，兼容不同版本 AstrBot / aiocqhttp 的客户端接口。"""
-        call_action = getattr(client, "call_action", None)
-        if callable(call_action):
-            try:
-                return await call_action(action, **kwargs)
-            except AttributeError:
-                pass
-        api = getattr(client, "api", None)
-        if api is not None:
-            api_call = getattr(api, "call_action", None)
-            if callable(api_call):
-                return await api_call(action, **kwargs)
-            api_action = getattr(api, action, None)
-            if callable(api_action):
-                return await api_action(**kwargs)
-        client_action = getattr(client, action, None)
-        if callable(client_action):
-            return await client_action(**kwargs)
-        raise AttributeError(f"OneBot client 不支持 {action} API")
+        return await self.onebot.call_action(client, action, **kwargs)
 
     async def _recall_onebot_message(self, event: AstrMessageEvent) -> None:
-        """通过 OneBot API 撤回玩家发送的偷偷上机指令消息；失败仅记录日志，不影响原有功能。"""
-        try:
-            platform_name = event.get_platform_name()
-        except Exception:
-            platform_name = getattr(getattr(event, "platform_meta", None), "name", "") or ""
-        if platform_name != "aiocqhttp":
-            return
-        try:
-            message_id = getattr(event.message_obj, "message_id", None)
-            if not message_id:
-                return
-            client = getattr(event, "bot", None)
-            if client is None:
-                return
-            candidates: list[Any] = []
-            try:
-                candidates.append(int(message_id))
-            except (TypeError, ValueError):
-                pass
-            candidates.append(str(message_id))
-            last_error: Exception | None = None
-            for candidate in candidates:
-                try:
-                    await self._call_onebot_action(client, "delete_msg", message_id=candidate)
-                    logger.info(f"新宿：已撤回偷偷上机指令消息 {message_id}")
-                    return
-                except Exception as exc:
-                    last_error = exc
-                    logger.debug(f"新宿撤回指令消息失败（{candidate}）: {exc}")
-            logger.error(f"新宿：撤回偷偷上机指令消息失败: {last_error}")
-        except Exception as exc:
-            logger.error(f"新宿：撤回偷偷上机指令消息失败: {exc}")
+        await self.onebot.recall_message(event)
 
     def _target_from_optional_arg(self, event: AstrMessageEvent) -> str:
         self._remember_sender_name(event)
@@ -365,7 +169,7 @@ class ShinjukuPlugin(Star):
                 qq = uid.split(":", 1)[1]
             else:
                 qq = self._sender_real_qq(event)
-            register_code = str(self.config.get("redeem_code_on_register", "") or "")
+            register_code = self.settings.redeem_code_on_register
             result = await self.service.register(qq, register_code)
             if result["created"]:
                 message = f"注册成功，用户 ID：{result['user']['id']}"
