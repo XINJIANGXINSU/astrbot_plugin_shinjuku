@@ -13,6 +13,7 @@
 astrbot_plugin_shinjuku/
 ├── asset_service.py      # 资产定义、用户资产与资产变更日志
 ├── billing_engine.py     # 无数据库依赖的纯计费分段与封顶计算
+├── billing_service.py    # 账单预览、优惠选择与退场结算
 ├── constants.py          # 资产标识与数据库迁移键
 ├── main.py               # 插件入口：指令注册、权限与业务编排
 ├── migrations.py         # 数据库初始化、旧字段升级与约束迁移

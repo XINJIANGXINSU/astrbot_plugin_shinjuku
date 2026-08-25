@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, AsyncIterator
 
 try:
     from .asset_service import AssetService
     from .billing_engine import BillingEngine
+    from .billing_service import BillingService
     from .constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
         CURRENCY_ASSET_TYPE,
@@ -36,15 +37,13 @@ try:
     from .storage import (
         DBConn,
         SQLitePool,
-        parse_datetime as _as_dt,
-        row_to_dict as _row,
-        rows_to_dicts as _rows,
     )
     from .user_service import UserService
     from .wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
     from asset_service import AssetService
     from billing_engine import BillingEngine
+    from billing_service import BillingService
     from constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
         CURRENCY_ASSET_TYPE,
@@ -74,9 +73,6 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
     from storage import (
         DBConn,
         SQLitePool,
-        parse_datetime as _as_dt,
-        row_to_dict as _row,
-        rows_to_dicts as _rows,
     )
     from user_service import UserService
     from wallet_service import WalletService
@@ -119,6 +115,16 @@ class ShinjukuService:
             self.self_open_door_enabled,
             lambda: _now(),
         )
+        self.billings = BillingService(
+            self.billing_engine,
+            self.billing_config,
+            self.points_per_amount,
+            self.login_grace_minutes,
+            self.sessions,
+            self.wallets,
+            self.assets,
+            lambda: _now(),
+        )
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -159,11 +165,7 @@ class ShinjukuService:
         )
 
     def _cap_points(self, cap_value: int) -> int:
-        """封顶金额折算积分：每 points_per_amount 元得 1 积分（向上取整）。"""
-        if self.points_per_amount <= 0 or cap_value <= 0:
-            return 0
-        denominator = self.points_per_amount * MONEY_SCALE
-        return (cap_value + denominator - 1) // denominator
+        return self.billings.cap_points(cap_value)
 
     async def find_user(self, uid: str | int, conn: DBConn | None = None) -> dict[str, Any] | None:
         if conn is None:
@@ -219,83 +221,11 @@ class ShinjukuService:
     async def logout(self, uid: str) -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                session_before = await self.active_session(uid, conn)
-                if not session_before:
-                    raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
-                played_seconds = int((_now() - session_before["createdAt"]).total_seconds())
-                door_opened = bool(int(session_before.get("doorOpened") or 0))
-                login_grace_seconds = self.login_grace_minutes * 60
-                # 只有成功自助开门的会话才启用首小时特殊门槛：
-                # 入场后不超过 login_grace_minutes 分钟离场时免费，超过后首小时按 1 小时计费。
-                force_mode = (
-                    door_opened
-                    and played_seconds <= login_grace_seconds
-                    and played_seconds < 3600
-                )
-                if force_mode:
-                    # 按强制离场处理：0 元、不扣钱、不发积分、不消耗优惠券（和 force_logout 一样）
-                    wallet_before = await self.wallet(uid, False, conn)
-                    await conn.execute(
-                        'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, "billingCost"=0, "finalCost"=0 WHERE id=?',
-                        _now(),
-                        session_before["id"],
-                    )
-                    closed = _row(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', session_before["id"]))
-                    return {
-                        "session": closed,
-                        "billing": {
-                            "totalCost": 0,
-                            "startTime": session_before["createdAt"],
-                            "endTime": closed.get("closedAt") or _now(),
-                            "segments": [],
-                            "blocks": [],
-                            "points": 0,
-                        },
-                        "wallet": wallet_before,
-                        "walletBefore": wallet_before,
-                        "walletAfter": await self.wallet(str(session_before["userId"]), True, conn),
-                        "loginGraceForced": True,
-                        "loginGraceMinutes": self.login_grace_minutes,
-                    }
-                preview = await self.billing(uid, conn)
-                wallet_before = preview["wallet"]
-                session = preview["session"]
-                billing = preview["billing"]
-                discount = preview.get("discount")
-                cost = session.get("costOverwrite")
-                if cost is None:
-                    cost = discount["finalCost"] if discount else billing["totalCost"]
-                cost = int(cost)
-
-                if cost > 0:
-                    await self.deduct_wallet(str(session["userId"]), cost, "会话结算: SESSION_SETTLEMENT", conn)
-                if discount and discount.get("consumedAssets"):
-                    await self.delete_user_assets(str(session["userId"]), discount["consumedAssets"], conn)
-                # 游玩积分：封顶段按封顶金额折算、正常段按游玩小时数 1 小时 1 积分（在 billing() 中计算）
-                points_earned = int(billing.get("points") or 0)
-                if points_earned > 0:
-                    await self.add_points(
-                        str(session["userId"]), points_earned, "游玩积分: SESSION_POINTS", conn
-                    )
-                    preview["pointsEarned"] = points_earned
-                await conn.execute(
-                    'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, "billingCost"=?, "finalCost"=? WHERE id=?',
-                    _now(),
-                    billing["totalCost"],
-                    cost,
-                    session["id"],
-                )
-                closed = _row(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', session["id"]))
-                preview["session"] = closed
-                preview["wallet"] = wallet_before
-                preview["walletBefore"] = wallet_before
-                preview["walletAfter"] = await self.wallet(str(session["userId"]), True, conn)
-                return preview
+                return await self.billings.logout(uid, conn)
 
     @staticmethod
     def _has_pass_for_billing(wallet: dict[str, Any]) -> bool:
-        passes = wallet.get("passes", {}).get("details", {}).get("available", []) or []
-        return len(passes) > 0
+        return BillingService.has_pass_for_billing(wallet)
 
     async def force_logout(self, uid: str) -> dict[str, Any]:
         """管理员强制退场：直接关闭会话，不做结算、不发积分。"""
@@ -304,138 +234,14 @@ class ShinjukuService:
                 return await self.sessions.force_logout(uid, conn)
 
     async def billing(self, uid: str, conn: DBConn | None = None) -> dict[str, Any]:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 return await self.billing(uid, acquired)
-
-        session = await self.active_session(uid, conn)
-        if not session:
-            raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
-        end = session.get("closedAt") or _now()
-        calculation_end = end
-        played_seconds = max(0, int((end - session["createdAt"]).total_seconds()))
-        door_opened = bool(int(session.get("doorOpened") or 0))
-        login_grace_seconds = self.login_grace_minutes * 60
-        if door_opened and login_grace_seconds < played_seconds < 3600:
-            # 成功开门后，超过首小时特殊门槛即按完整 1 小时预览和结算。
-            # 顶层 endTime 仍保留真实查询/退场时间，只有计费区间扩展到首小时末。
-            calculation_end = session["createdAt"] + timedelta(hours=1)
-        wallet = await self.wallet(uid, True, conn)
-        monthly_pass = any(
-            asset.get("assetDefId") == MONTHLY_PASS_ASSET_ID and asset.get("assetType") == PASS_ASSET_TYPE
-            for asset in wallet["passes"].get("details", {}).get("available", [])
-        )
-        cap24 = amount_to_cents(self.billing_config.get("cap_24h_pass" if monthly_pass else "cap_24h") or 0)
-        day_cap = amount_to_cents(self.billing_config.get("day_cap_pass" if monthly_pass else "day_cap") or 69)
-        night_cap = amount_to_cents(self.billing_config.get("night_cap_pass" if monthly_pass else "night_cap") or 69)
-        # 按 24 小时块逐块封顶：每个从入场时刻起的 24 小时块最多收 cap24
-        segments: list[dict[str, Any]] = []
-        blocks: list[dict[str, Any]] = []
-        overnight_caps: list[dict[str, Any]] = []
-        total_cost = 0
-        total_points = 0
-        current = session["createdAt"]
-        while current < calculation_end:
-            block_end = min(current + timedelta(days=1), calculation_end)
-            block = self.calculate_billing(
-                current,
-                block_end,
-                monthly_pass,
-                session_start=session["createdAt"],
-            )
-            raw_block_cost = block["totalCost"]
-            block_cost = min(raw_block_cost, cap24) if cap24 > 0 else raw_block_cost
-            total_cost += block_cost
-            overnight_cap = block.get("overnightCap")
-            if overnight_cap:
-                overnight_cap = dict(overnight_cap)
-                overnight_cap["blockIndex"] = len(blocks)
-                overnight_caps.append(overnight_cap)
-            if cap24 > 0 and block["totalCost"] > cap24:
-                # 触发 24 小时封顶：该块积分按封顶金额折算
-                total_points += self._cap_points(cap24)
-            else:
-                if overnight_cap:
-                    total_points += self._cap_points(night_cap)
-                for seg in block["segments"]:
-                    if seg.get("overnightCapCovered"):
-                        continue
-                    if seg["isCapped"]:
-                        # 触发白天/夜晚时段封顶：该段积分按封顶金额折算
-                        cap = day_cap if seg["ruleId"] == 1 else night_cap
-                        total_points += self._cap_points(cap)
-                    else:
-                        # 正常消费：按游玩小时数，1 小时 1 积分（不足 1 小时不计）
-                        total_points += seg["durationMinutes"] // 60
-            if cap24 > 0:
-                for seg in block["segments"]:
-                    seg["blockIndex"] = len(blocks)
-                blocks.append(
-                    {
-                        "startTime": current,
-                        "endTime": block_end,
-                        "rawCost": raw_block_cost,
-                        "cappedCost": block_cost,
-                        "isCapped": raw_block_cost > cap24,
-                        "overnightCap": overnight_cap,
-                    }
-                )
-            segments.extend(block["segments"])
-            current = block_end
-        result = {
-            "totalCost": total_cost,
-            "startTime": session["createdAt"],
-            "endTime": end,
-            "segments": segments,
-            "blocks": blocks,
-            "overnightCaps": overnight_caps,
-            "points": total_points,
-        }
-
-        response = {"session": session, "billing": result, "wallet": wallet}
-
-        coupon = self._best_coupon(wallet)
-        if coupon and coupon["rateBps"] < RATE_SCALE:
-            total = response["billing"]["totalCost"]
-            if total > 0:
-                final_cost = _discounted_cents(total, coupon["rateBps"])
-                response["discount"] = {
-                    "originalCost": total,
-                    "finalCost": final_cost,
-                    "consumedAssets": [coupon["id"]],
-                    "appliedLogs": [
-                        {
-                            "asset": coupon["name"],
-                            "assetId": coupon["id"],
-                            "saved": total - final_cost,
-                            "type": "RATE",
-                            "breakdown": [],
-                        }
-                    ],
-                }
-        return response
+        return await self.billings.billing(uid, conn)
 
     @staticmethod
     def _best_coupon(wallet: dict[str, Any]) -> dict[str, Any] | None:
-        """从可用优惠券中选折扣最大（rateBps 最小）的一张。"""
-        candidates = [
-            asset
-            for asset in wallet["tickets"].get("details", {}).get("available", [])
-            if asset.get("asset", {}).get("billingEffect", {}).get("type") == "RATE"
-        ]
-        if not candidates:
-            return None
-        best = min(
-            candidates,
-            key=lambda a: (a["asset"]["billingEffect"]["rateBps"], a.get("expireAt") or datetime.max),
-        )
-        effect = best["asset"]["billingEffect"]
-        return {
-            "id": best["id"],
-            "name": best["asset"].get("name") or "优惠券",
-            "rateBps": int(effect["rateBps"]),
-        }
+        return BillingService.best_coupon(wallet)
 
     async def history(self, uid: str, limit: int = 5) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
