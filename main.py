@@ -13,6 +13,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .nickname_cache import NicknameCache
 from .presentation import (
+    date_time,
     format_billing,
     format_history,
     format_items,
@@ -20,6 +21,7 @@ from .presentation import (
     format_players,
     format_pricing,
     format_wallet,
+    money,
 )
 from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents
 
@@ -668,8 +670,8 @@ class ShinjukuPlugin(Star):
             return (
                 prefix +
                 f"为用户 {label} 增加{self.currency}成功\n"
-                f"增加前: {_money(result['originalBalance'])}\n"
-                f"增加后: {_money(result['finalBalance'])}"
+                f"增加前: {money(result['originalBalance'])}\n"
+                f"增加后: {money(result['finalBalance'])}"
             )
 
         yield event.plain_result(await self._safe(run()))
@@ -694,7 +696,7 @@ class ShinjukuPlugin(Star):
             return (
                 prefix +
                 f"已为用户 {label} 发放 30 天通行证\n"
-                f"到期时间: {_dt(result.get('expireAt'))}"
+                f"到期时间: {date_time(result.get('expireAt'))}"
             )
 
         yield event.plain_result(await self._safe(run()))
@@ -729,7 +731,7 @@ class ShinjukuPlugin(Star):
             return (
                 prefix +
                 f"已为用户 {user_label} 发放 {label}\n"
-                f"有效期至: {_dt(result['userAsset'].get('expireAt'))}"
+                f"有效期至: {date_time(result['userAsset'].get('expireAt'))}"
             )
 
         yield event.plain_result(await self._safe(run()))
@@ -752,7 +754,7 @@ class ShinjukuPlugin(Star):
             result = await self.service.create_gift_code(present_id, amount, times)
             return (
                 f"已生成兑换码：{result['code']}\n"
-                f"礼包：{result['name']}（含 {_money(result['currency_amount'])} {self.currency}）\n"
+                f"礼包：{result['name']}（含 {money(result['currency_amount'])} {self.currency}）\n"
                 f"可领取次数：{result['max_use_count']}\n"
                 "发送 /redeem <兑换码> 即可领取"
             )
@@ -779,8 +781,8 @@ class ShinjukuPlugin(Star):
                 raise ShinjukuError("扣费金额必须大于 0。")
             result = await self.service.charge_wallet(uid, amount, f"mj charge by {self._sender_id(event)}")
             return (
-                f"MJ 扣费成功：-{_money(amount)} {self.currency}\n"
-                f"余额：{_money(result['originalBalance'])} -> {_money(result['finalBalance'])} {self.currency}"
+                f"MJ 扣费成功：-{money(amount)} {self.currency}\n"
+                f"余额：{money(result['originalBalance'])} -> {money(result['finalBalance'])} {self.currency}"
             )
 
         yield event.plain_result(await self._safe(run()))

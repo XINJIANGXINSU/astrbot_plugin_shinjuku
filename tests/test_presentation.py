@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta
+from pathlib import Path
 
+from presentation import date_time as public_date_time
+from presentation import money as public_money
 from presentation.assets import format_items, mahjong_rank_name
 from presentation.billing import format_billing, format_leave_billing
 from presentation.common import date_time, duration, money, number, time_range
@@ -20,6 +23,15 @@ def test_common_presenters_keep_public_value_formats():
     assert date_time(None) == "永不过期"
     assert duration(75) == "1小时15分钟"
     assert time_range(START, END) == "08/25 11:30:00 - 08/25 12:30:00"
+    assert public_money(1234) == "12.34"
+    assert public_date_time(START) == "2026/08/25 11:30:00"
+
+
+def test_main_has_no_calls_to_removed_presentation_helpers():
+    source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
+
+    assert "_money(" not in source
+    assert "_dt(" not in source
 
 
 def test_wallet_presenter_contract():
