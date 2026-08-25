@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 import shlex
 import sqlite3
-from datetime import datetime
 from os import path
 from typing import Any
 
@@ -13,331 +12,19 @@ from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .nickname_cache import NicknameCache
-from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents, cents_to_text
+from .presentation import (
+    format_billing,
+    format_history,
+    format_items,
+    format_leave_billing,
+    format_players,
+    format_pricing,
+    format_wallet,
+)
+from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents
 
 
-def _money(value: Any) -> str:
-    return cents_to_text(value)
-
-
-def _number(value: Any) -> str:
-    return str(int(value or 0))
-
-
-def _dt(value: Any) -> str:
-    if not value:
-        return "永不过期"
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return value
-    return value.strftime("%Y/%m/%d %H:%M:%S")
-
-
-def _duration(minutes: int) -> str:
-    if minutes >= 60:
-        return f"{minutes // 60}小时{minutes % 60}分钟"
-    return f"{minutes}分钟"
-
-
-def _format_time_range(start: datetime, end: datetime) -> str:
-    return f"{start:%m/%d %H:%M:%S} - {end:%m/%d %H:%M:%S}"
-
-
-def _format_segment_lines(segment: dict[str, Any], currency: str, indent: str = "") -> list[str]:
-    rule_name = segment["ruleName"]
-    if segment.get("reason") == "late_entry_first_hour":
-        rule_name += "（深夜入场首小时）"
-    suffix = ""
-    if segment.get("overnightCapCovered"):
-        suffix = "（计入包夜封顶）"
-    elif segment["isCapped"]:
-        suffix = " (已封顶)"
-    fee = f"{_money(segment['cost'])} {currency}{suffix}"
-    return [
-        f"{indent}- {rule_name}",
-        f"{indent}  时段: {_format_time_range(segment['startTime'], segment['endTime'])}",
-        f"{indent}  时长: {_duration(segment['durationMinutes'])}",
-        f"{indent}  费用: {fee}",
-    ]
-
-
-def _format_billing_blocks(billing: dict[str, Any], currency: str) -> list[str]:
-    segments = billing.get("segments") or []
-    blocks = billing.get("blocks") or []
-    lines: list[str] = []
-    if not segments:
-        lines.append("  (无)")
-        return lines
-    if not blocks:
-        for segment in segments:
-            lines.extend(_format_segment_lines(segment, currency))
-        for cap in billing.get("overnightCaps") or []:
-            lines.append(
-                f"包夜封顶: {_money(cap['rawCost'])} {currency} → "
-                f"{_money(cap['cappedCost'])} {currency}"
-            )
-        return lines
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for segment in segments:
-        grouped.setdefault(segment.get("blockIndex", 0), []).append(segment)
-    for index, block in enumerate(blocks, start=1):
-        lines.append(f"[24小时块 {index}/{len(blocks)}] {_format_time_range(block['startTime'], block['endTime'])}")
-        for segment in grouped.get(index - 1, []):
-            lines.extend(_format_segment_lines(segment, currency, indent="  "))
-        overnight_cap = block.get("overnightCap")
-        if overnight_cap:
-            lines.append(
-                f"  包夜封顶: {_money(overnight_cap['rawCost'])} {currency} → "
-                f"{_money(overnight_cap['cappedCost'])} {currency}"
-            )
-        if block.get("isCapped"):
-            lines.append(f"  小计: {_money(block['rawCost'])} {currency} → 封顶 {_money(block['cappedCost'])} {currency}")
-        else:
-            lines.append(f"  小计: {_money(block['cappedCost'])} {currency}")
-    return lines
-
-
-def _format_wallet(wallet: dict[str, Any], currency: str) -> str:
-    lines = [
-        "--- 钱包 ---",
-        f"总余额: {_money(wallet['total']['available'])}/{_money(wallet['total']['all'])} {currency}",
-        f"付费余额: {_money(wallet['paid']['available'])} {currency}",
-        f"免费余额: {_money(wallet['free']['available'])}/{_money(wallet['free']['all'])} {currency}",
-        f"积分: {_number(wallet['points']['available'])}",
-        f"优惠券: {wallet['tickets']['available']}/{wallet['tickets']['all']} 张",
-        f"通行证: {wallet['passes']['available']}/{wallet['passes']['all']} 个",
-    ]
-    return "\n".join(lines)
-
-
-def _format_pricing(cfg: dict[str, Any], currency: str) -> str:
-    day_price = amount_to_cents(cfg.get("day_price") or 12)
-    day_price_pass = amount_to_cents(cfg.get("day_price_pass") or 11)
-    day_cap = amount_to_cents(cfg.get("day_cap") or 69)
-    day_cap_pass = amount_to_cents(cfg.get("day_cap_pass") or 59)
-    night_price = amount_to_cents(cfg.get("night_price") or 13)
-    night_price_pass = amount_to_cents(cfg.get("night_price_pass") or 12)
-    night_cap = amount_to_cents(cfg.get("night_cap") or 69)
-    night_cap_pass = amount_to_cents(cfg.get("night_cap_pass") or 59)
-    cap_24h = amount_to_cents(cfg.get("cap_24h") or 99)
-    cap_24h_pass = amount_to_cents(cfg.get("cap_24h_pass") or 88)
-    day_start = str(cfg.get("day_start") or "11:30")
-    day_end = str(cfg.get("day_end") or "00:00")
-    night_start = str(cfg.get("night_start") or "00:00")
-    night_end = str(cfg.get("night_end") or "12:00")
-    late_day_start = str(cfg.get("late_day_start") or "23:00")
-    night_cap_cover_start = str(cfg.get("night_cap_cover_start") or "23:30")
-
-    lines = [
-        "--- 新宿定价表 ---",
-        f"【白天】{day_start} - {day_end}",
-        f"  普通用户：{_money(day_price)} {currency}/小时，封顶 {_money(day_cap)} {currency}",
-        f"  月卡用户：{_money(day_price_pass)} {currency}/小时，封顶 {_money(day_cap_pass)} {currency}",
-        f"【夜晚】{night_start} - {night_end}",
-        f"  普通用户：{_money(night_price)} {currency}/小时，封顶 {_money(night_cap)} {currency}",
-        f"  月卡用户：{_money(night_price_pass)} {currency}/小时，封顶 {_money(night_cap_pass)} {currency}",
-        f"【深夜衔接】{late_day_start} - {day_end} 入场首小时按白天计费",
-        f"  {night_cap_cover_start} 后入场时，首小时白天费用纳入包夜封顶，不再额外叠加",
-        f"【连续 24 小时】封顶 {_money(cap_24h)} {currency}（月卡 {_money(cap_24h_pass)} {currency}）",
-    ]
-    return "\n".join(lines)
-
-
-def _format_billing(res: dict[str, Any], currency: str) -> str:
-    billing = res["billing"]
-    session = res["session"]
-    discount = res.get("discount")
-    original_cost = discount["originalCost"] if discount else billing["totalCost"]
-    final_cost = discount["finalCost"] if discount else billing["totalCost"]
-    if session.get("costOverwrite") is not None:
-        final_cost = session["costOverwrite"]
-
-    total_minutes = int((billing["endTime"] - session["createdAt"]).total_seconds() // 60)
-    current_balance = res["wallet"]["total"]["available"]
-    lines = [
-        "--- 账单详情 ---",
-        f"入场: {_dt(session['createdAt'])}{'（偷偷上机）' if session.get('ENTRY_TYPE') == 'sneak' else ''}",
-        f"结算: {_dt(billing['endTime'])}",
-        f"时长: {_duration(total_minutes)}",
-        "---",
-        f"计费价: {_money(original_cost)} {currency}",
-    ]
-    if discount and discount.get("appliedLogs"):
-        for item in discount["appliedLogs"]:
-            lines.append(f"  -「{item['asset']}」 -{_money(item['saved'])} {currency}")
-    lines.extend(
-        [
-            f"结算价: {_money(final_cost)} {currency}",
-            "---",
-            f"当前余额: {_money(current_balance)} {currency}",
-            f"扣款后: {_money(current_balance - final_cost)} {currency}",
-            "---",
-            "计费区间:",
-        ]
-    )
-    if billing["segments"]:
-        lines.extend(_format_billing_blocks(billing, currency))
-    else:
-        lines.append("  (无)")
-
-    passes = res["wallet"].get("passes", {}).get("details", {}).get("available", [])
-    if passes and passes[0].get("expireAt"):
-        lines.extend(["---", f"您的月卡将于 {_dt(passes[0]['expireAt'])} 到期。"])
-    return "\n".join(lines)
-
-
-def _format_leave_billing(res: dict[str, Any], currency: str, user_label: str) -> str:
-    billing = res["billing"]
-    session = res["session"]
-    discount = res.get("discount")
-    original_cost = discount["originalCost"] if discount else billing["totalCost"]
-    final_cost = discount["finalCost"] if discount else billing["totalCost"]
-    if session.get("costOverwrite") is not None:
-        final_cost = session["costOverwrite"]
-    forced_short = bool(res.get("loginGraceForced"))
-    grace_minutes = int(res.get("loginGraceMinutes") or 0)
-
-    wallet_before = res.get("walletBefore") or res["wallet"]
-    wallet_after = res.get("walletAfter")
-    balance_before = wallet_before["total"]["available"]
-    balance_after = wallet_after["total"]["available"] if wallet_after else balance_before - final_cost
-    total_minutes = int((billing["endTime"] - session["createdAt"]).total_seconds() // 60)
-
-    lines = [
-        f"✅ 已为用户 {user_label} 退场",
-        "离开时请带走随身垃圾及手套，确认房门关好，欢迎您再次光临新宿。",
-    ]
-    if forced_short:
-        lines.insert(
-            1,
-            f"（{grace_minutes}分钟内离场，本次不参与结算）",
-        )
-    lines.extend([
-        "--- 账单详情 ---",
-        f"入场: {_dt(session['createdAt'])}{'（偷偷上机）' if session.get('ENTRY_TYPE') == 'sneak' else ''}",
-        f"结束: {_dt(billing['endTime'])}",
-        f"时长: {_duration(total_minutes)}",
-        "---",
-        f"计费价: {_money(original_cost)} {currency}",
-    ])
-    if balance_after < 0:
-        lines.insert(1, f"⚠️ 本次结算后欠费 {_money(-balance_after)} {currency}，请联系主理人补款。")
-    if discount and discount.get("appliedLogs"):
-        for item in discount["appliedLogs"]:
-            lines.append(f"  -「{item['asset']}」 -{_money(item['saved'])} {currency}")
-    lines.extend(
-        [
-            f"结算价: {_money(final_cost)} {currency}",
-            "---",
-            f"当前余额: {_money(balance_before)} {currency}",
-            f"扣款后: {_money(balance_after)} {currency}",
-        ]
-    )
-    points_earned = res.get("pointsEarned")
-    if points_earned:
-        lines.append(f"🎁 本次游玩获得 {_number(points_earned)} 积分")
-    lines.extend(["---", "计费区间:"])
-    if billing["segments"]:
-        lines.extend(_format_billing_blocks(billing, currency))
-    else:
-        lines.append("  (无)")
-    return "\n".join(lines)
-
-
-def _mahjong_rank_name(points: int) -> str:
-    ranks = (
-        (19000, "魂天"), (15500, "雀圣 III"), (12500, "雀圣 II"),
-        (10000, "雀圣 I"), (8200, "雀豪 III"), (6600, "雀豪 II"),
-        (5200, "雀豪 I"), (4000, "雀杰 III"), (3000, "雀杰 II"),
-        (2200, "雀杰 I"), (1500, "雀士 III"), (1000, "雀士 II"),
-        (500, "雀士 I"), (0, "初心者"),
-    )
-    return next(name for threshold, name in ranks if points >= threshold)
-
-
-def _format_items(
-    assets: list[dict[str, Any]], currency: str, mahjong_rank: dict[str, Any] | None = None
-) -> str:
-    if not assets and not mahjong_rank:
-        return "暂无资产。"
-    lines = ["--- 资产 ---"]
-    for item in assets:
-        asset = item.get("asset") or {}
-        name = asset.get("name") or f"{item.get('assetType')}:{item.get('assetDefId')}"
-        asset_type = item.get("assetType")
-        if asset_type == "CURRENCY":
-            suffix = currency
-        elif asset_type == "POINTS":
-            suffix = "积分"
-        else:
-            suffix = "个"
-        count_text = _money(item["count"]) if asset_type == "CURRENCY" else _number(item["count"])
-        lines.append(
-            f"[{item['id']}] {name} x{count_text} {suffix}"
-            f"｜生效: {_dt(item.get('activeAt'))}｜过期: {_dt(item.get('expireAt'))}"
-        )
-    if mahjong_rank:
-        games = int(mahjong_rank.get("games") or 0)
-        rank_points = int(mahjong_rank.get("rankPoints") or 0)
-        average_place = 0.0
-        if games:
-            average_place = (
-                int(mahjong_rank.get("firstCount") or 0)
-                + int(mahjong_rank.get("secondCount") or 0) * 2
-                + int(mahjong_rank.get("thirdCount") or 0) * 3
-                + int(mahjong_rank.get("fourthCount") or 0) * 4
-            ) / games
-        lines.extend(
-            [
-                "--- 日麻段位 ---",
-                f"{_mahjong_rank_name(rank_points)}｜段位分 {rank_points}｜Rate {float(mahjong_rank.get('rating') or 1500):.2f}",
-                f"总对局 {games}｜平均顺位 {average_place:.2f}" if games else "尚未完成段位对局",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _format_history(sessions: list[dict[str, Any]], currency: str) -> str:
-    if not sessions:
-        return "暂无历史记录。"
-    lines = ["--- 历史记录 ---"]
-    for item in sessions:
-        start = item.get("createdAt")
-        end = item.get("closedAt")
-        cost = item.get("finalCost")
-        active = "进行中" if item.get("isActive") else "已结束"
-        marker = "（偷偷上机）" if item.get("ENTRY_TYPE") == "sneak" else ""
-        lines.append(f"[{item['id']}] {active}{marker}｜{_dt(start)} -> {_dt(end) if end else '现在'}｜{_money(cost)} {currency}")
-    return "\n".join(lines)
-
-
-def _format_players(users: list[dict[str, Any]], nicknames: dict[str, str] | None = None, mask_sneak: bool = False) -> str:
-    nicknames = nicknames or {}
-    lines = [f"👥 店内目前共有 {len(users)} 人"]
-    for user in users:
-        qq = ""
-        for bind in user.get("binds", []):
-            if bind.get("type") == "QQ":
-                qq = str(bind.get("bid") or "")
-                break
-        session = (user.get("sessions") or [{}])[0]
-        if mask_sneak and session.get("ENTRY_TYPE") == "sneak":
-            name = "未知玩家"
-        else:
-            name = nicknames.get(qq) or qq or f"用户#{user['id']}"
-        lines.extend(
-            [
-                "",
-                f"玩家: {name}",
-                f"入场时间: {_dt(session.get('createdAt'))}",
-            ]
-        )
-    return "\n".join(lines)
-
-
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.3")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.4")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -686,7 +373,6 @@ class ShinjukuPlugin(Star):
             return f"已经注册过了，用户 ID：{result['user']['id']}"
 
         yield event.plain_result(await self._safe(run()))
-
     @filter.command("login", alias={"入场", "上机"})
     async def login_cmd(self, event: AstrMessageEvent):
         """登录/入场"""
@@ -807,7 +493,7 @@ class ShinjukuPlugin(Star):
             label = self._at_label(event, uid)
             if sneaked:
                 label = "未知玩家"
-            return _format_leave_billing(result, self.currency, label)
+            return format_leave_billing(result, self.currency, label)
 
         result = await self._safe(run())
         if sneaked:
@@ -843,7 +529,7 @@ class ShinjukuPlugin(Star):
         async def run():
             uid = self._target_from_optional_arg(event)
             result = await self.service.billing(uid)
-            return _format_billing(result, self.currency)
+            return format_billing(result, self.currency)
 
         yield event.plain_result(await self._safe(run()))
 
@@ -853,7 +539,7 @@ class ShinjukuPlugin(Star):
         async def run():
             uid = self._target_from_optional_arg(event)
             wallet = await self.service.wallet(uid, False)
-            return _format_wallet(wallet, self.currency)
+            return format_wallet(wallet, self.currency)
 
         yield event.plain_result(await self._safe(run()))
 
@@ -864,7 +550,7 @@ class ShinjukuPlugin(Star):
             uid = self._target_from_optional_arg(event)
             assets = await self.service.user_assets(uid, True)
             mahjong_rank = await self.service.mahjong_rank(uid)
-            return _format_items(assets, self.currency, mahjong_rank)
+            return format_items(assets, self.currency, mahjong_rank)
 
         yield event.plain_result(await self._safe(run()))
 
@@ -876,7 +562,7 @@ class ShinjukuPlugin(Star):
             args = self._args(event)
             limit = int(args[0]) if args and args[0].isdigit() else 5
             sessions = await self.service.history(self._sender_uid(event), limit)
-            return _format_history(sessions, self.currency)
+            return format_history(sessions, self.currency)
 
         yield event.plain_result(await self._safe(run()))
 
@@ -895,7 +581,7 @@ class ShinjukuPlugin(Star):
             self._at_label(event, uid)
             limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
             sessions = await self.service.history(uid, limit)
-            return _format_history(sessions, self.currency)
+            return format_history(sessions, self.currency)
 
         yield event.plain_result(await self._safe(run()))
 
@@ -928,7 +614,7 @@ class ShinjukuPlugin(Star):
         self._remember_sender_name(event)
         async def run():
             users = await self.service.logged_in_users()
-            return _format_players(
+            return format_players(
                 users,
                 self.nicknames.snapshot(self._nickname_scope(event)),
                 self.sneak_login_enabled,
@@ -939,7 +625,7 @@ class ShinjukuPlugin(Star):
     @filter.regex(r"^定价表$")
     async def pricing_table_cmd(self, event: AstrMessageEvent):
         """发送当前定价表"""
-        yield event.plain_result(_format_pricing(self.service.billing_config, self.currency))
+        yield event.plain_result(format_pricing(self.service.billing_config, self.currency))
 
     @filter.command("redeem")
     async def redeem_cmd(self, event: AstrMessageEvent):
