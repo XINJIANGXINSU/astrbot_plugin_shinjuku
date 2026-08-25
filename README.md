@@ -21,6 +21,7 @@ astrbot_plugin_shinjuku/
 ├── money.py              # 金额、折扣的纯计算与格式转换
 ├── nickname_cache.py     # 分群昵称缓存
 ├── onebot_adapter.py     # OneBot API 兼容调用与消息撤回
+├── present_service.py    # 礼包、兑换码与兑换记录业务
 ├── presentation/         # 无副作用的消息展示层
 ├── schema.py             # 新数据库的标准 SQLite Schema
 ├── settings.py           # 插件配置默认值、类型转换与范围归一化

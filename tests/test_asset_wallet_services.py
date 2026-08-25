@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from asset_service import AssetService
+from present_service import PresentService
 from shinjuku_service import ShinjukuService
 from wallet_service import WalletService
 
@@ -11,12 +12,13 @@ def test_service_composes_asset_and_wallet_collaborators(tmp_path):
 
     assert isinstance(service.assets, AssetService)
     assert isinstance(service.wallets, WalletService)
+    assert isinstance(service.presents, PresentService)
 
 
 def test_collaborators_do_not_depend_on_facade_or_own_transactions():
     root = Path(__file__).resolve().parents[1]
 
-    for name in ("asset_service.py", "wallet_service.py"):
+    for name in ("asset_service.py", "wallet_service.py", "present_service.py"):
         source = (root / name).read_text(encoding="utf-8")
         assert "shinjuku_service" not in source
         assert "_acquire" not in source

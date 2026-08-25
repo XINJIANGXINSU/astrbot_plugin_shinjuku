@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -34,6 +33,7 @@ try:
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
+    from .present_service import PresentService
     from .storage import (
         DBConn,
         SQLitePool,
@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
+    from present_service import PresentService
     from storage import (
         DBConn,
         SQLitePool,
@@ -77,14 +78,6 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         rows_to_dicts as _rows,
     )
     from wallet_service import WalletService
-
-
-def _json(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return json.loads(value)
-    return value
 
 
 def _now() -> datetime:
@@ -114,6 +107,7 @@ class ShinjukuService:
         self.migrations = DatabaseMigrator()
         self.assets = AssetService(self.currency, self.find_user, lambda: _now())
         self.wallets = WalletService(self.assets, self.find_user, lambda: _now())
+        self.presents = PresentService(self.assets, self.find_user, lambda: _now())
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -682,120 +676,33 @@ class ShinjukuService:
         await self.assets.log_asset_change(conn, asset, original_count, action, comment)
 
     async def upsert_present_by_id(self, uid: str | int, present_id: int, conn: DBConn | None = None) -> Any:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 async with acquired.transaction(immediate=True):
                     return await self.upsert_present_by_id(uid, present_id, acquired)
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        present = _row(await conn.fetchrow('SELECT * FROM "Present" WHERE id=?', present_id))
-        if not present:
-            raise ShinjukuError("注册礼包不存在。", "ASSET_NOT_FOUND")
-        return await self._upsert_present(conn, user, present, f"present:{present_id}")
+        return await self.presents.upsert_present_by_id(uid, present_id, conn)
 
     async def redeem(self, uid: str | int, code: str, conn: DBConn | None = None) -> dict[str, Any]:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 async with acquired.transaction(immediate=True):
                     return await self.redeem(uid, code, acquired)
-
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        redeem = _row(await conn.fetchrow('SELECT * FROM "Redeem" WHERE code=?', code))
-        if not redeem:
-            raise ShinjukuError("兑换码不存在或已使用。", "REDEEM_CODE_NOT_FOUND_OR_USED")
-        present_row = _row(await conn.fetchrow('SELECT * FROM "Present" WHERE id=?', redeem["presentId"]))
-        if not present_row:
-            raise ShinjukuError("兑换码对应的礼包不存在。", "ASSET_NOT_FOUND")
-        now = _now()
-        active_at = _as_dt(redeem.get("activeAt"))
-        expire_at = _as_dt(redeem.get("expireAt"))
-        if active_at and active_at > now:
-            raise ShinjukuError("兑换码尚未生效。", "REDEEM_NOT_ACTIVE")
-        if expire_at and expire_at < now:
-            raise ShinjukuError("兑换码已过期。", "REDEEM_EXPIRED")
-        used_count = int(
-            await conn.fetchval('SELECT count(*) FROM "RedeemRecord" WHERE "redeemId"=?', redeem["id"]) or 0
-        )
-        if used_count >= int(redeem.get("maxUseCount") or 1):
-            raise ShinjukuError("兑换码已达到最大使用次数。", "REDEEM_CODE_LIMIT_EXCEEDED")
-        present = dict(present_row)
-        present["body"] = _json(present_row.get("body"))
-        assets = await self._upsert_present(conn, user, present, f"redeem:{code}")
-        await conn.execute(
-            'INSERT INTO "RedeemRecord" ("userId","redeemId","presentId") VALUES (?,?,?)',
-            user["id"],
-            redeem["id"],
-            redeem["presentId"],
-        )
-        return {"present": present, "assets": assets}
+        return await self.presents.redeem(uid, code, conn)
 
     async def create_gift_code(self, present_id: int, currency_amount_cents: int, max_use_count: int) -> dict[str, Any]:
         """基于现有礼包生成兑换码：货币数量按参数覆盖，每人限领一次，总数封顶 max_use_count。"""
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                present = _row(await conn.fetchrow('SELECT * FROM "Present" WHERE id=?', present_id))
-                if not present:
-                    raise ShinjukuError("礼包不存在。", "ASSET_NOT_FOUND")
-                amount_cents = int(currency_amount_cents)
-                if amount_cents <= 0:
-                    raise ShinjukuError("货币数量必须大于 0。", "INVALID_AMOUNT")
-                uses = int(max_use_count)
-                if uses <= 0:
-                    raise ShinjukuError("兑换次数必须大于 0。", "INVALID_USE_COUNT")
-                await self.ensure_currency_asset(conn)
-                body = _json(present.get("body")) or []
-                new_body = [dict(item) for item in body]
-                currency_item = next(
-                    (
-                        item
-                        for item in new_body
-                        if str(item.get("assetType")) == CURRENCY_ASSET_TYPE
-                        and int(item.get("assetId") or 0) == PAID_CURRENCY_ASSET_ID
-                    ),
-                    None,
+                return await self.presents.create_gift_code(
+                    present_id,
+                    currency_amount_cents,
+                    max_use_count,
+                    conn,
                 )
-                if currency_item:
-                    currency_item["count"] = amount_cents
-                else:
-                    new_body.append(
-                        {
-                            "assetType": CURRENCY_ASSET_TYPE,
-                            "assetId": PAID_CURRENCY_ASSET_ID,
-                            "count": amount_cents,
-                        }
-                    )
-                name = f"{present.get('name') or '礼包'}·兑换码"
-                created = await conn.execute(
-                    'INSERT INTO "Present" (name, "oncePerUser", body) VALUES (?,1,?)',
-                    name,
-                    json.dumps(new_body),
-                )
-                code = await self._generate_code(conn)
-                await conn.execute(
-                    'INSERT INTO "Redeem" (code, "presentId", "maxUseCount") VALUES (?,?,?)',
-                    code,
-                    created.lastrowid,
-                    uses,
-                )
-                return {
-                    "code": code,
-                    "name": name,
-                    "currency_amount": amount_cents,
-                    "max_use_count": uses,
-                }
 
     @staticmethod
     async def _generate_code(conn: DBConn) -> str:
-        while True:
-            code = secrets.token_hex(4).upper()
-            exists = await conn.fetchval('SELECT 1 FROM "Redeem" WHERE code=?', code)
-            if not exists:
-                return code
+        return await PresentService.generate_code(conn)
 
     async def _upsert_present(
         self,
@@ -804,49 +711,7 @@ class ShinjukuService:
         present: dict[str, Any],
         comment_prefix: str,
     ) -> list[dict[str, Any]]:
-        user_redeem_count = int(
-            await conn.fetchval(
-                'SELECT count(*) FROM "RedeemRecord" WHERE "userId"=? AND "presentId"=?',
-                user["id"],
-                present["id"],
-            )
-            or 0
-        )
-        if present.get("oncePerUser") and user_redeem_count >= 1:
-            raise ShinjukuError("该礼物一个账号只能兑换一次。", "REDEEM_GIFT_ONCE_PER_USER")
-        body = _json(present["body"]) or []
-        changes = []
-        for item in body:
-            if item.get("oncePerUser") and user_redeem_count > 0:
-                continue
-            amount = int(item["count"]) if "count" in item else 1
-            if item.get("id"):
-                asset = _row(await conn.fetchrow('SELECT * FROM "Asset" WHERE id=?', int(item["id"])))
-            else:
-                asset = _row(
-                    await conn.fetchrow(
-                        'SELECT * FROM "Asset" WHERE "assetId"=? AND type=?',
-                        int(item["assetId"]),
-                        str(item["assetType"]),
-                    )
-                )
-                if not asset:
-                    asset = await self._ensure_standard_asset(
-                        conn, int(item.get("assetId") or 0), str(item.get("assetType") or "")
-                    )
-            if not asset:
-                continue
-            changes.append(
-                await self.add_asset_by_def(
-                    user["id"],
-                    asset,
-                    amount,
-                    item.get("comment") or comment_prefix,
-                    conn,
-                    item,
-                )
-            )
-        return changes
+        return await self.presents.upsert_present(conn, user, present, comment_prefix)
 
     async def _ensure_standard_asset(self, conn: DBConn, asset_id: int, asset_type: str) -> dict[str, Any] | None:
         return await self.assets.ensure_standard_asset(conn, asset_id, asset_type)
