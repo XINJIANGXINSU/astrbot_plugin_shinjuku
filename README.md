@@ -14,6 +14,7 @@ astrbot_plugin_shinjuku/
 ├── asset_service.py      # 资产定义、用户资产与资产变更日志
 ├── billing_engine.py     # 无数据库依赖的纯计费分段与封顶计算
 ├── billing_service.py    # 账单预览、优惠选择与退场结算
+├── CHANGELOG.md          # AstrBot 插件详情页使用的版本更新日志
 ├── constants.py          # 资产标识与数据库迁移键
 ├── main.py               # 插件入口：指令注册、权限与业务编排
 ├── migrations.py         # 数据库初始化、旧字段升级与约束迁移
@@ -36,15 +37,6 @@ astrbot_plugin_shinjuku/
 ├── _conf_schema.json     # 设置表单（AstrBot Web 控制台自动生成配置页）
 └── requirements.txt      # 依赖：aiosqlite
 ```
-
-## v0.4.0 更新说明
-
-- 将原有巨型业务类拆分为用户、会话、资产、钱包、礼包兑换和计费结算协作者。
-- 将金额与异常、配置解析、纯计费引擎、数据库 Schema、存储和迁移拆成独立基础模块。
-- 将 AstrBot 事件解析与 OneBot API 调用隔离到平台适配层，展示层不再依赖业务门面。
-- `ShinjukuService` 保留原有调用接口，统一管理数据库连接和事务；各业务协作者不自行提交事务。
-- 保持现有指令、配置项和 SQLite 数据兼容，升级时会继续执行已有的自动迁移流程。
-- 当前自动化验证覆盖 75 项测试，并包含计费规则、迁移、并发兑换和事务回滚场景。
 
 ## 功能特性
 
