@@ -1,4 +1,4 @@
-from settings import PluginSettings
+from core.settings import PluginSettings
 
 
 def test_plugin_settings_apply_defaults():

@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from ..money import amount_to_cents
+    from ..core.money import amount_to_cents
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from money import amount_to_cents
+    from core.money import amount_to_cents
 
 from .common import money
 

@@ -8,17 +8,17 @@ from datetime import datetime
 from typing import Any, Callable
 
 try:
-    from .errors import ShinjukuError
-    from .money import cents_to_text
-    from .storage import DBConn, row_to_dict, rows_to_dicts
+    from ..core.errors import ShinjukuError
+    from ..core.money import cents_to_text
+    from ..infrastructure.storage import DBConn, row_to_dict, rows_to_dicts
     from .user_service import UserService
     from .wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from errors import ShinjukuError
-    from money import cents_to_text
-    from storage import DBConn, row_to_dict, rows_to_dicts
-    from user_service import UserService
-    from wallet_service import WalletService
+    from core.errors import ShinjukuError
+    from core.money import cents_to_text
+    from infrastructure.storage import DBConn, row_to_dict, rows_to_dicts
+    from services.user_service import UserService
+    from services.wallet_service import WalletService
 
 
 Clock = Callable[[], datetime]

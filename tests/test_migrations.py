@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 
-from constants import (
+from core.constants import (
     ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
     IDENTITY_CONSTRAINTS_MIGRATION_KEY,
     MONEY_MIGRATION_KEY,

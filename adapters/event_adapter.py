@@ -7,11 +7,11 @@ import shlex
 from typing import Any
 
 try:
-    from .errors import ShinjukuError
+    from ..core.errors import ShinjukuError
     from .nickname_cache import NicknameCache
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from errors import ShinjukuError
-    from nickname_cache import NicknameCache
+    from core.errors import ShinjukuError
+    from adapters.nickname_cache import NicknameCache
 
 
 COMMAND_NAMES = {

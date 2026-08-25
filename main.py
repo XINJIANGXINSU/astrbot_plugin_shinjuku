@@ -10,11 +10,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .errors import ShinjukuError
-from .event_adapter import EventAdapter
-from .money import amount_to_cents
-from .nickname_cache import NicknameCache
-from .onebot_adapter import OneBotAdapter
+from .adapters.event_adapter import EventAdapter
+from .adapters.nickname_cache import NicknameCache
+from .adapters.onebot_adapter import OneBotAdapter
+from .core.errors import ShinjukuError
+from .core.money import amount_to_cents
+from .core.settings import PluginSettings
 from .presentation import (
     date_time,
     format_billing,
@@ -26,7 +27,6 @@ from .presentation import (
     format_wallet,
     money,
 )
-from .settings import PluginSettings
 from .shinjuku_service import ShinjukuService
 
 

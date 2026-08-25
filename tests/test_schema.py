@@ -1,6 +1,6 @@
 import sqlite3
 
-from schema import SCHEMA_SQL
+from infrastructure.schema import SCHEMA_SQL
 
 
 def test_schema_creates_all_core_tables():

@@ -1,4 +1,4 @@
-from nickname_cache import NicknameCache
+from adapters.nickname_cache import NicknameCache
 
 
 def test_nicknames_are_isolated_by_scope():
