@@ -8,7 +8,7 @@ from typing import Any
 try:
     from .errors import ShinjukuError
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from errors import ShinjukuError
+    from core.errors import ShinjukuError
 
 
 MONEY_SCALE = 100

@@ -5,10 +5,8 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 
 try:
-    from .asset_service import AssetService
-    from .billing_engine import BillingEngine
-    from .billing_service import BillingService
-    from .constants import (
+    from .core.billing_engine import BillingEngine
+    from .core.constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
         CURRENCY_ASSET_TYPE,
         FREE_CURRENCY_ASSET_ID,
@@ -21,9 +19,8 @@ try:
         POINTS_ASSET_TYPE,
         TICKET_ASSET_TYPE,
     )
-    from .errors import ShinjukuError
-    from .migrations import DatabaseMigrator
-    from .money import (
+    from .core.errors import ShinjukuError
+    from .core.money import (
         MONEY_SCALE,
         RATE_SCALE,
         amount_to_cents,
@@ -32,19 +29,20 @@ try:
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
-    from .present_service import PresentService
-    from .session_service import SessionService
-    from .storage import (
+    from .infrastructure.migrations import DatabaseMigrator
+    from .infrastructure.storage import (
         DBConn,
         SQLitePool,
     )
-    from .user_service import UserService
-    from .wallet_service import WalletService
+    from .services.asset_service import AssetService
+    from .services.billing_service import BillingService
+    from .services.present_service import PresentService
+    from .services.session_service import SessionService
+    from .services.user_service import UserService
+    from .services.wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from asset_service import AssetService
-    from billing_engine import BillingEngine
-    from billing_service import BillingService
-    from constants import (
+    from core.billing_engine import BillingEngine
+    from core.constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
         CURRENCY_ASSET_TYPE,
         FREE_CURRENCY_ASSET_ID,
@@ -57,9 +55,8 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         POINTS_ASSET_TYPE,
         TICKET_ASSET_TYPE,
     )
-    from errors import ShinjukuError
-    from migrations import DatabaseMigrator
-    from money import (
+    from core.errors import ShinjukuError
+    from core.money import (
         MONEY_SCALE,
         RATE_SCALE,
         amount_to_cents,
@@ -68,14 +65,17 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         discount_tenths_text as _discount_tenths_text,
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
-    from present_service import PresentService
-    from session_service import SessionService
-    from storage import (
+    from infrastructure.migrations import DatabaseMigrator
+    from infrastructure.storage import (
         DBConn,
         SQLitePool,
     )
-    from user_service import UserService
-    from wallet_service import WalletService
+    from services.asset_service import AssetService
+    from services.billing_service import BillingService
+    from services.present_service import PresentService
+    from services.session_service import SessionService
+    from services.user_service import UserService
+    from services.wallet_service import WalletService
 
 
 def _now() -> datetime:

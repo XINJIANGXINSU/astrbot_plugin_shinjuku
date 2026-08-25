@@ -6,11 +6,11 @@ from datetime import datetime
 from typing import Any, Callable
 
 try:
-    from .errors import ShinjukuError
-    from .storage import DBConn, row_to_dict
+    from ..core.errors import ShinjukuError
+    from ..infrastructure.storage import DBConn, row_to_dict
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from errors import ShinjukuError
-    from storage import DBConn, row_to_dict
+    from core.errors import ShinjukuError
+    from infrastructure.storage import DBConn, row_to_dict
 
 
 Clock = Callable[[], datetime]

@@ -4,8 +4,8 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import shinjuku_service as service_module
-from errors import ShinjukuError
-from money import amount_to_cents, cents_to_text
+from core.errors import ShinjukuError
+from core.money import amount_to_cents, cents_to_text
 from shinjuku_service import MONEY_MIGRATION_KEY, ShinjukuService
 
 

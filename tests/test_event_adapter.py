@@ -1,5 +1,5 @@
-from event_adapter import EventAdapter
-from nickname_cache import NicknameCache
+from adapters.event_adapter import EventAdapter
+from adapters.nickname_cache import NicknameCache
 
 
 class AtComponent:

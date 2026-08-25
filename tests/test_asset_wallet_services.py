@@ -1,13 +1,13 @@
 import asyncio
 from pathlib import Path
 
-from asset_service import AssetService
-from billing_service import BillingService
-from present_service import PresentService
-from session_service import SessionService
+from services.asset_service import AssetService
+from services.billing_service import BillingService
+from services.present_service import PresentService
+from services.session_service import SessionService
 from shinjuku_service import ShinjukuService
-from user_service import UserService
-from wallet_service import WalletService
+from services.user_service import UserService
+from services.wallet_service import WalletService
 
 
 def test_service_composes_asset_and_wallet_collaborators(tmp_path):
@@ -32,10 +32,35 @@ def test_collaborators_do_not_depend_on_facade_or_own_transactions():
         "session_service.py",
         "billing_service.py",
     ):
-        source = (root / name).read_text(encoding="utf-8")
+        source = (root / "services" / name).read_text(encoding="utf-8")
         assert "shinjuku_service" not in source
         assert "_acquire" not in source
         assert ".transaction(" not in source
+
+
+def test_implementation_modules_are_grouped_by_responsibility():
+    root = Path(__file__).resolve().parents[1]
+
+    assert {path.name for path in (root / "core").glob("*.py")} >= {
+        "billing_engine.py",
+        "constants.py",
+        "errors.py",
+        "money.py",
+        "settings.py",
+    }
+    assert {path.name for path in (root / "infrastructure").glob("*.py")} >= {
+        "migrations.py",
+        "schema.py",
+        "storage.py",
+    }
+    assert {path.name for path in (root / "adapters").glob("*.py")} >= {
+        "event_adapter.py",
+        "nickname_cache.py",
+        "onebot_adapter.py",
+    }
+    assert not (root / "wallet_service.py").exists()
+    assert not (root / "storage.py").exists()
+    assert not (root / "event_adapter.py").exists()
 
 
 def test_wallet_collaborator_uses_callers_transaction(tmp_path):

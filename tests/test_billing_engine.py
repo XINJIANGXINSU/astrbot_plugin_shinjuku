@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from billing_engine import BillingEngine
+from core.billing_engine import BillingEngine
 from shinjuku_service import ShinjukuService
 
 
@@ -42,7 +42,7 @@ def test_service_calculate_billing_remains_a_compatible_facade(tmp_path):
 
 def test_billing_engine_has_no_storage_or_service_dependency():
     source = (
-        Path(__file__).parents[1] / "billing_engine.py"
+        Path(__file__).parents[1] / "core" / "billing_engine.py"
     ).read_text(encoding="utf-8")
 
     assert "shinjuku_service" not in source

@@ -1,6 +1,6 @@
 import asyncio
 
-from onebot_adapter import OneBotAdapter
+from adapters.onebot_adapter import OneBotAdapter
 
 
 class FakeLogger:

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from storage import SQLitePool, row_to_dict
+from infrastructure.storage import SQLitePool, row_to_dict
 
 
 def test_row_to_dict_normalizes_known_datetime_columns():
