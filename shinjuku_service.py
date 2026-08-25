@@ -8,10 +8,33 @@ import secrets
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, AsyncIterator
 
 import aiosqlite
+
+try:
+    from .errors import ShinjukuError
+    from .money import (
+        MONEY_SCALE,
+        RATE_SCALE,
+        amount_to_cents,
+        cents_to_text,
+        discounted_cents as _discounted_cents,
+        discount_tenths_text as _discount_tenths_text,
+        discount_tenths_to_bps as _discount_tenths_to_bps,
+    )
+except ImportError:  # pragma: no cover - standalone test/import compatibility
+    from errors import ShinjukuError
+    from money import (
+        MONEY_SCALE,
+        RATE_SCALE,
+        amount_to_cents,
+        cents_to_text,
+        discounted_cents as _discounted_cents,
+        discount_tenths_text as _discount_tenths_text,
+        discount_tenths_to_bps as _discount_tenths_to_bps,
+    )
 
 
 CURRENCY_ASSET_TYPE = "CURRENCY"
@@ -22,18 +45,9 @@ PAID_CURRENCY_ASSET_ID = 10001
 FREE_CURRENCY_ASSET_ID = 10002
 MONTHLY_PASS_ASSET_ID = 10001
 POINTS_ASSET_ID = 20001
-MONEY_SCALE = 100
-RATE_SCALE = 10000
 MONEY_MIGRATION_KEY = "money_integer_cents_v1"
 IDENTITY_CONSTRAINTS_MIGRATION_KEY = "identity_session_constraints_v1"
 ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY = "asset_redeem_constraints_v1"
-
-
-class ShinjukuError(Exception):
-    def __init__(self, message: str, code: str = "SHINJUKU_ERROR"):
-        super().__init__(message)
-        self.message = message
-        self.code = code
 
 
 def _json(value: Any) -> Any:
@@ -42,45 +56,6 @@ def _json(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return value
-
-
-def amount_to_cents(value: Any) -> int:
-    """把用户/配置中的元转换成整数分，统一使用四舍五入（ROUND_HALF_UP）。"""
-    try:
-        amount = Decimal(str(value or 0))
-    except (InvalidOperation, ValueError, TypeError) as exc:
-        raise ShinjukuError("金额格式不正确。", "INVALID_AMOUNT") from exc
-    if not amount.is_finite():
-        raise ShinjukuError("金额格式不正确。", "INVALID_AMOUNT")
-    return int((amount * MONEY_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-
-def cents_to_text(value: Any) -> str:
-    cents = int(value or 0)
-    sign = "-" if cents < 0 else ""
-    whole, fraction = divmod(abs(cents), MONEY_SCALE)
-    return f"{sign}{whole}" if fraction == 0 else f"{sign}{whole}.{fraction:02d}"
-
-
-def _discount_tenths_to_bps(value: Any) -> int:
-    try:
-        tenths = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError) as exc:
-        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT") from exc
-    if not tenths.is_finite():
-        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT")
-    bps = int((tenths * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    if not 0 <= bps <= RATE_SCALE:
-        raise ShinjukuError("折扣必须在 0-10 折之间。", "INVALID_DISCOUNT")
-    return bps
-
-
-def _discounted_cents(amount_cents: int, rate_bps: int) -> int:
-    return (int(amount_cents) * int(rate_bps) + RATE_SCALE // 2) // RATE_SCALE
-
-
-def _discount_tenths_text(rate_bps: int) -> str:
-    return format((Decimal(int(rate_bps)) / 1000).normalize(), "f")
 
 
 def _now() -> datetime:

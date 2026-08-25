@@ -11,8 +11,13 @@
 
 ```
 astrbot_plugin_shinjuku/
-├── main.py               # 插件入口：指令注册、权限、消息格式化
+├── main.py               # 插件入口：指令注册、权限与业务编排
+├── errors.py             # 跨层共享的领域异常
+├── money.py              # 金额、折扣的纯计算与格式转换
+├── nickname_cache.py     # 分群昵称缓存
+├── presentation/         # 无副作用的消息展示层
 ├── shinjuku_service.py   # 业务层：SQLite 存取、计费引擎、欠费、兑换码
+├── tests/                # 计费、并发、迁移与展示层测试
 ├── metadata.yaml         # 插件元数据
 ├── _conf_schema.json     # 设置表单（AstrBot Web 控制台自动生成配置页）
 └── requirements.txt      # 依赖：aiosqlite

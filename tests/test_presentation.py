@@ -34,6 +34,14 @@ def test_main_has_no_calls_to_removed_presentation_helpers():
     assert "_dt(" not in source
 
 
+def test_presentation_does_not_depend_on_service_module():
+    presentation_dir = Path(__file__).parents[1] / "presentation"
+
+    for module_path in presentation_dir.glob("*.py"):
+        source = module_path.read_text(encoding="utf-8")
+        assert "shinjuku_service" not in source, module_path.name
+
+
 def test_wallet_presenter_contract():
     wallet = {
         "total": {"available": 1234, "all": 2234},

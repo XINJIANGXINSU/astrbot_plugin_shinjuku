@@ -6,9 +6,9 @@ from datetime import datetime
 from typing import Any
 
 try:
-    from ..shinjuku_service import cents_to_text
+    from ..money import cents_to_text
 except ImportError:  # pragma: no cover - standalone test/import compatibility
-    from shinjuku_service import cents_to_text
+    from money import cents_to_text
 
 
 def money(value: Any) -> str:

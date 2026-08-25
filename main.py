@@ -11,6 +11,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .errors import ShinjukuError
+from .money import amount_to_cents
 from .nickname_cache import NicknameCache
 from .presentation import (
     date_time,
@@ -23,7 +25,7 @@ from .presentation import (
     format_wallet,
     money,
 )
-from .shinjuku_service import ShinjukuError, ShinjukuService, amount_to_cents
+from .shinjuku_service import ShinjukuService
 
 
 @register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.4")
