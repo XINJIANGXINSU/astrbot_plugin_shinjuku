@@ -28,6 +28,7 @@ astrbot_plugin_shinjuku/
 ├── shinjuku_service.py   # 业务门面：用户、会话、结算与兑换编排
 ├── storage.py            # SQLite 行转换、事务包装与连接池
 ├── tests/                # 计费、并发、迁移与展示层测试
+├── user_service.py       # 用户、平台绑定与联动资料查询
 ├── wallet_service.py     # 钱包聚合、充值、扣款与权益发放
 ├── metadata.yaml         # 插件元数据
 ├── _conf_schema.json     # 设置表单（AstrBot Web 控制台自动生成配置页）

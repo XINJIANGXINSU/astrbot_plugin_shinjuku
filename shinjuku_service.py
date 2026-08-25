@@ -41,6 +41,7 @@ try:
         row_to_dict as _row,
         rows_to_dicts as _rows,
     )
+    from .user_service import UserService
     from .wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
     from asset_service import AssetService
@@ -77,6 +78,7 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         row_to_dict as _row,
         rows_to_dicts as _rows,
     )
+    from user_service import UserService
     from wallet_service import WalletService
 
 
@@ -105,9 +107,10 @@ class ShinjukuService:
         self.login_grace_minutes = max(0, int(login_grace_minutes or 0))
         self.storage = SQLitePool(db_path)
         self.migrations = DatabaseMigrator()
-        self.assets = AssetService(self.currency, self.find_user, lambda: _now())
-        self.wallets = WalletService(self.assets, self.find_user, lambda: _now())
-        self.presents = PresentService(self.assets, self.find_user, lambda: _now())
+        self.users = UserService(lambda: _now())
+        self.assets = AssetService(self.currency, self.users.find_user, lambda: _now())
+        self.wallets = WalletService(self.assets, self.users.find_user, lambda: _now())
+        self.presents = PresentService(self.assets, self.users.find_user, lambda: _now())
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -163,42 +166,18 @@ class ShinjukuService:
         return (cap_value + denominator - 1) // denominator
 
     async def find_user(self, uid: str | int, conn: DBConn | None = None) -> dict[str, Any] | None:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 return await self.find_user(uid, acquired)
-
-        if isinstance(uid, int):
-            return _row(await conn.fetchrow('SELECT * FROM "User" WHERE id=?', uid))
-
-        uid_text = str(uid)
-        if ":" in uid_text:
-            bind_type, bind_id = uid_text.split(":", 1)
-            return _row(
-                await conn.fetchrow(
-                    'SELECT u.* FROM "User" u JOIN "Bind" b ON b."userId"=u.id WHERE b.type=? AND b.bid=? LIMIT 1',
-                    bind_type,
-                    bind_id,
-                )
-            )
-        if uid_text.isdigit():
-            return _row(await conn.fetchrow('SELECT * FROM "User" WHERE id=?', int(uid_text)))
-        return None
+        return await self.users.find_user(uid, conn)
 
     async def register(self, platform_id: str, register_code: str = "") -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                exists = await self.find_user(f"QQ:{platform_id}", conn)
-                if exists:
-                    return {"user": exists, "created": False, "gift": None}
-                created = await conn.execute('INSERT INTO "User" ("createdAt") VALUES (?)', _now())
-                user = _row(await conn.fetchrow('SELECT * FROM "User" WHERE id=?', created.lastrowid))
-                await conn.execute(
-                    'INSERT INTO "Bind" (type, bid, "userId") VALUES (?, ?, ?)',
-                    "QQ",
-                    platform_id,
-                    user["id"],
-                )
+                registration = await self.users.register(platform_id, conn)
+                user = registration["user"]
+                if not registration["created"]:
+                    return {"user": user, "created": False, "gift": None}
                 gift = None
                 gift_error = None
                 if register_code:
@@ -580,19 +559,7 @@ class ShinjukuService:
         if conn is None:
             async with self._acquire() as acquired:
                 return await self.mahjong_rank(uid, acquired)
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        exists = await conn.fetchval(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='MahjongRank'"
-        )
-        if not exists:
-            return None
-        return _row(
-            await conn.fetchrow(
-                'SELECT * FROM "MahjongRank" WHERE "userId"=? LIMIT 1', user["id"]
-            )
-        )
+        return await self.users.mahjong_rank(uid, conn)
 
     async def add_paid_currency(self, uid: str, amount_cents: int, comment: str = "admin add") -> dict[str, Any]:
         async with self._acquire() as conn:
