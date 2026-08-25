@@ -11,6 +11,19 @@ from typing import Any, AsyncIterator
 
 try:
     from .billing_engine import BillingEngine
+    from .constants import (
+        ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
+        CURRENCY_ASSET_TYPE,
+        FREE_CURRENCY_ASSET_ID,
+        IDENTITY_CONSTRAINTS_MIGRATION_KEY,
+        MONEY_MIGRATION_KEY,
+        MONTHLY_PASS_ASSET_ID,
+        PAID_CURRENCY_ASSET_ID,
+        PASS_ASSET_TYPE,
+        POINTS_ASSET_ID,
+        POINTS_ASSET_TYPE,
+        TICKET_ASSET_TYPE,
+    )
     from .errors import ShinjukuError
     from .money import (
         MONEY_SCALE,
@@ -31,6 +44,19 @@ try:
     )
 except ImportError:  # pragma: no cover - standalone test/import compatibility
     from billing_engine import BillingEngine
+    from constants import (
+        ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
+        CURRENCY_ASSET_TYPE,
+        FREE_CURRENCY_ASSET_ID,
+        IDENTITY_CONSTRAINTS_MIGRATION_KEY,
+        MONEY_MIGRATION_KEY,
+        MONTHLY_PASS_ASSET_ID,
+        PAID_CURRENCY_ASSET_ID,
+        PASS_ASSET_TYPE,
+        POINTS_ASSET_ID,
+        POINTS_ASSET_TYPE,
+        TICKET_ASSET_TYPE,
+    )
     from errors import ShinjukuError
     from money import (
         MONEY_SCALE,
@@ -49,19 +75,6 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         row_to_dict as _row,
         rows_to_dicts as _rows,
     )
-
-
-CURRENCY_ASSET_TYPE = "CURRENCY"
-TICKET_ASSET_TYPE = "TICKET"
-PASS_ASSET_TYPE = "PASS"
-POINTS_ASSET_TYPE = "POINTS"
-PAID_CURRENCY_ASSET_ID = 10001
-FREE_CURRENCY_ASSET_ID = 10002
-MONTHLY_PASS_ASSET_ID = 10001
-POINTS_ASSET_ID = 20001
-MONEY_MIGRATION_KEY = "money_integer_cents_v1"
-IDENTITY_CONSTRAINTS_MIGRATION_KEY = "identity_session_constraints_v1"
-ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY = "asset_redeem_constraints_v1"
 
 
 def _json(value: Any) -> Any:
