@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
 import secrets
 import sqlite3
@@ -10,8 +8,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, AsyncIterator
-
-import aiosqlite
 
 try:
     from .billing_engine import BillingEngine
@@ -26,6 +22,13 @@ try:
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
     from .schema import SCHEMA_SQL
+    from .storage import (
+        DBConn,
+        SQLitePool,
+        parse_datetime as _as_dt,
+        row_to_dict as _row,
+        rows_to_dicts as _rows,
+    )
 except ImportError:  # pragma: no cover - standalone test/import compatibility
     from billing_engine import BillingEngine
     from errors import ShinjukuError
@@ -39,6 +42,13 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         discount_tenths_to_bps as _discount_tenths_to_bps,
     )
     from schema import SCHEMA_SQL
+    from storage import (
+        DBConn,
+        SQLitePool,
+        parse_datetime as _as_dt,
+        row_to_dict as _row,
+        rows_to_dicts as _rows,
+    )
 
 
 CURRENCY_ASSET_TYPE = "CURRENCY"
@@ -66,19 +76,6 @@ def _now() -> datetime:
     return datetime.now()
 
 
-def _as_dt(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        text = str(value).replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(text)
-    if parsed.tzinfo:
-        return parsed.astimezone().replace(tzinfo=None)
-    return parsed
-
-
 def _future_dt(duration_ms: Any) -> datetime | None:
     if not duration_ms:
         return None
@@ -92,87 +89,6 @@ def _same_dt(left: datetime | None, right: datetime | None) -> bool:
     if left is None or right is None:
         return left is None and right is None
     return left.replace(tzinfo=None) == right.replace(tzinfo=None)
-
-
-DATETIME_COLUMNS = {
-    "createdAt",
-    "closedAt",
-    "activeAt",
-    "expireAt",
-    "billingStart",
-    "billingEnd",
-    "startTime",
-    "endTime",
-}
-
-
-def _row(row: Any) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    result = dict(row)
-    for key in DATETIME_COLUMNS:
-        value = result.get(key)
-        if isinstance(value, str):
-            result[key] = _as_dt(value)
-    return result
-
-
-def _rows(rows: list[Any]) -> list[dict[str, Any]]:
-    return [_row(row) for row in rows]
-
-
-class ExecResult:
-    def __init__(self, lastrowid: int | None = None):
-        self.lastrowid = lastrowid
-
-
-class DBConn:
-    """SQLite 连接包装：提供与旧 asyncpg 用法接近的 fetch/execute/transaction 接口。"""
-
-    def __init__(self, conn: aiosqlite.Connection):
-        self._conn = conn
-
-    @staticmethod
-    def _params(params: tuple[Any, ...]) -> tuple[Any, ...]:
-        return tuple(value.isoformat() if isinstance(value, datetime) else value for value in params)
-
-    async def fetchrow(self, sql: str, *params: Any) -> dict[str, Any] | None:
-        cursor = await self._conn.execute(sql, self._params(params))
-        try:
-            return _row(await cursor.fetchone())
-        finally:
-            await cursor.close()
-
-    async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
-        cursor = await self._conn.execute(sql, self._params(params))
-        try:
-            return _rows(await cursor.fetchall())
-        finally:
-            await cursor.close()
-
-    async def fetchval(self, sql: str, *params: Any) -> Any:
-        row = await self.fetchrow(sql, *params)
-        if not row:
-            return None
-        return next(iter(row.values()))
-
-    async def execute(self, sql: str, *params: Any) -> ExecResult:
-        cursor = await self._conn.execute(sql, self._params(params))
-        try:
-            return ExecResult(cursor.lastrowid)
-        finally:
-            await cursor.close()
-
-    @asynccontextmanager
-    async def transaction(self, immediate: bool = False) -> AsyncIterator["DBConn"]:
-        try:
-            if immediate:
-                await self._conn.execute("BEGIN IMMEDIATE")
-            yield self
-            await self._conn.commit()
-        except BaseException:
-            await self._conn.rollback()
-            raise
 
 
 class ShinjukuService:
@@ -194,50 +110,21 @@ class ShinjukuService:
         self.max_active_checkcodes = max(1, int(max_active_checkcodes or 20))
         self.self_open_door_enabled = bool(self_open_door_enabled)
         self.login_grace_minutes = max(0, int(login_grace_minutes or 0))
-        self._queue: asyncio.Queue[DBConn] | None = None
-        self._init_lock = asyncio.Lock()
+        self.storage = SQLitePool(db_path)
 
     async def connect(self) -> None:
-        if self._queue is not None:
-            return
-        async with self._init_lock:
-            if self._queue is not None:
-                return
-            if not self.db_path:
-                raise ShinjukuError("请先在插件配置中填写 database_path。")
-            directory = os.path.dirname(os.path.abspath(self.db_path))
-            os.makedirs(directory, exist_ok=True)
-            raw_conns = []
-            for _ in range(5):
-                raw = await aiosqlite.connect(self.db_path)
-                raw.row_factory = sqlite3.Row
-                await raw.execute("PRAGMA journal_mode=WAL")
-                await raw.execute("PRAGMA foreign_keys=ON")
-                await raw.execute("PRAGMA busy_timeout=5000")
-                raw_conns.append(raw)
-            wrapped = [DBConn(raw) for raw in raw_conns]
-            await self._init_schema(wrapped[0])
-            queue: asyncio.Queue[DBConn] = asyncio.Queue()
-            for item in wrapped:
-                await queue.put(item)
-            self._queue = queue
+        if not self.db_path:
+            raise ShinjukuError("请先在插件配置中填写 database_path。")
+        await self.storage.connect(self._init_schema)
 
     async def close(self) -> None:
-        if self._queue is not None:
-            while not self._queue.empty():
-                item = self._queue.get_nowait()
-                await item._conn.close()
-            self._queue = None
+        await self.storage.close()
 
     @asynccontextmanager
     async def _acquire(self) -> AsyncIterator[DBConn]:
         await self.connect()
-        assert self._queue is not None
-        conn = await self._queue.get()
-        try:
+        async with self.storage.acquire() as conn:
             yield conn
-        finally:
-            await self._queue.put(conn)
 
     async def _init_schema(self, conn: DBConn) -> None:
         await conn._conn.executescript(SCHEMA_SQL)

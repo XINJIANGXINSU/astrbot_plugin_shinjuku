@@ -20,6 +20,7 @@ astrbot_plugin_shinjuku/
 ├── schema.py             # 新数据库的标准 SQLite Schema
 ├── settings.py           # 插件配置默认值、类型转换与范围归一化
 ├── shinjuku_service.py   # 业务层：SQLite 存取、计费引擎、欠费、兑换码
+├── storage.py            # SQLite 行转换、事务包装与连接池
 ├── tests/                # 计费、并发、迁移与展示层测试
 ├── metadata.yaml         # 插件元数据
 ├── _conf_schema.json     # 设置表单（AstrBot Web 控制台自动生成配置页）
