@@ -30,7 +30,7 @@ from .settings import PluginSettings
 from .shinjuku_service import ShinjukuService
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.3.4")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.4.0")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
