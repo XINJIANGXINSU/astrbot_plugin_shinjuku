@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
 try:
+    from .asset_service import AssetService
     from .billing_engine import BillingEngine
     from .constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
@@ -40,7 +41,9 @@ try:
         row_to_dict as _row,
         rows_to_dicts as _rows,
     )
+    from .wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
+    from asset_service import AssetService
     from billing_engine import BillingEngine
     from constants import (
         ASSET_REDEEM_CONSTRAINTS_MIGRATION_KEY,
@@ -73,6 +76,7 @@ except ImportError:  # pragma: no cover - standalone test/import compatibility
         row_to_dict as _row,
         rows_to_dicts as _rows,
     )
+    from wallet_service import WalletService
 
 
 def _json(value: Any) -> Any:
@@ -85,21 +89,6 @@ def _json(value: Any) -> Any:
 
 def _now() -> datetime:
     return datetime.now()
-
-
-def _future_dt(duration_ms: Any) -> datetime | None:
-    if not duration_ms:
-        return None
-    duration = float(duration_ms)
-    if duration <= 0:
-        return None
-    return _now() + timedelta(milliseconds=duration)
-
-
-def _same_dt(left: datetime | None, right: datetime | None) -> bool:
-    if left is None or right is None:
-        return left is None and right is None
-    return left.replace(tzinfo=None) == right.replace(tzinfo=None)
 
 
 class ShinjukuService:
@@ -123,6 +112,8 @@ class ShinjukuService:
         self.login_grace_minutes = max(0, int(login_grace_minutes or 0))
         self.storage = SQLitePool(db_path)
         self.migrations = DatabaseMigrator()
+        self.assets = AssetService(self.currency, self.find_user, lambda: _now())
+        self.wallets = WalletService(self.assets, self.find_user, lambda: _now())
 
     async def connect(self) -> None:
         if not self.db_path:
@@ -573,61 +564,10 @@ class ShinjukuService:
             return users
 
     async def wallet(self, uid: str, details: bool = False, conn: DBConn | None = None) -> dict[str, Any]:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 return await self.wallet(uid, details, acquired)
-
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        assets = await self.user_assets(
-            uid, True, conn, [CURRENCY_ASSET_TYPE, TICKET_ASSET_TYPE, PASS_ASSET_TYPE, POINTS_ASSET_TYPE]
-        )
-        paid = [a for a in assets if a["assetDefId"] == PAID_CURRENCY_ASSET_ID and a["assetType"] == CURRENCY_ASSET_TYPE]
-        free = [a for a in assets if a["assetDefId"] == FREE_CURRENCY_ASSET_ID and a["assetType"] == CURRENCY_ASSET_TYPE]
-        tickets = [a for a in assets if a["assetType"] == TICKET_ASSET_TYPE]
-        passes = [a for a in assets if a["assetType"] == PASS_ASSET_TYPE]
-        points = [a for a in assets if a["assetType"] == POINTS_ASSET_TYPE]
-
-        def available(asset: dict[str, Any]) -> bool:
-            now = _now()
-            return (asset.get("activeAt") is None or asset["activeAt"] <= now) and (
-                asset.get("expireAt") is None or asset["expireAt"] > now
-            )
-
-        free_available = [a for a in free if available(a)]
-        ticket_available = [a for a in tickets if available(a)]
-        pass_available = [a for a in passes if available(a)]
-        paid_amount = sum(int(a["count"]) for a in paid)
-        free_available_amount = sum(int(a["count"]) for a in free_available)
-        free_total_amount = sum(int(a["count"]) for a in free)
-        points_amount = sum(int(a["count"]) for a in points)
-        wallet = {
-            "total": {"available": paid_amount + free_available_amount, "all": paid_amount + free_total_amount},
-            "paid": {"available": paid_amount, "all": paid_amount},
-            "free": {"available": free_available_amount, "all": free_total_amount},
-            "tickets": {"available": len(ticket_available), "all": len(tickets)},
-            "passes": {"available": len(pass_available), "all": len(passes)},
-            "points": {"available": points_amount, "all": points_amount},
-        }
-        if details:
-            sort_key = lambda a: a.get("expireAt") or datetime.max
-            wallet["paid"]["details"] = {"available": sorted(paid, key=sort_key), "unavailable": []}
-            wallet["free"]["details"] = {
-                "available": sorted(free_available, key=sort_key),
-                "unavailable": [a for a in free if not available(a)],
-            }
-            wallet["tickets"]["details"] = {
-                "available": sorted(ticket_available, key=sort_key),
-                "unavailable": [a for a in tickets if not available(a)],
-            }
-            wallet["passes"]["details"] = {
-                "available": sorted(pass_available, key=sort_key),
-                "unavailable": [a for a in passes if not available(a)],
-            }
-            wallet["points"]["details"] = {"available": sorted(points, key=sort_key), "unavailable": []}
-        return wallet
+        return await self.wallets.wallet(uid, conn, details)
 
     async def user_assets(
         self,
@@ -636,30 +576,10 @@ class ShinjukuService:
         conn: DBConn | None = None,
         asset_types: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 return await self.user_assets(uid, with_asset, acquired, asset_types)
-
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        if asset_types:
-            placeholders = ",".join("?" for _ in asset_types)
-            rows = await conn.fetch(
-                f'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetType" IN ({placeholders}) ORDER BY id',
-                user["id"],
-                *asset_types,
-            )
-        else:
-            rows = await conn.fetch('SELECT * FROM "UserAsset" WHERE "userId"=? ORDER BY id', user["id"])
-        result = _rows(rows)
-        assets = {asset["id"]: asset for asset in _rows(await conn.fetch('SELECT * FROM "Asset"'))}
-        for item in result:
-            item["asset"] = dict(assets.get(item.get("assetId")) or {})
-            if item["asset"].get("billingEffect"):
-                item["asset"]["billingEffect"] = _json(item["asset"]["billingEffect"])
-        return result
+        return await self.assets.user_assets(uid, conn, with_asset, asset_types)
 
     async def mahjong_rank(self, uid: str, conn: DBConn | None = None) -> dict[str, Any] | None:
         """读取日麻插件写入同一新宿数据库的段位资料；未联动或未参赛时返回 None。"""
@@ -683,52 +603,7 @@ class ShinjukuService:
     async def add_paid_currency(self, uid: str, amount_cents: int, comment: str = "admin add") -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                user = await self.find_user(uid, conn)
-                if not user:
-                    raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-                amount_cents = int(amount_cents)
-                if amount_cents <= 0:
-                    raise ShinjukuError("添加金额必须大于 0。", "INVALID_AMOUNT")
-                wallet = await self.wallet(uid, False, conn)
-                asset = await self.ensure_currency_asset(conn)
-                existing = _row(
-                    await conn.fetchrow(
-                        'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetId"=? AND "assetDefId"=? '
-                        'AND "assetType"=? AND "activeAt" IS NULL AND "expireAt" IS NULL LIMIT 1',
-                        user["id"],
-                        asset["id"],
-                        PAID_CURRENCY_ASSET_ID,
-                        CURRENCY_ASSET_TYPE,
-                    )
-                )
-                if existing:
-                    await conn.execute(
-                        'UPDATE "UserAsset" SET count=count+? WHERE id=?',
-                        amount_cents,
-                        existing["id"],
-                    )
-                    updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
-                    await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
-                    changed = updated
-                else:
-                    created = await conn.execute(
-                        'INSERT INTO "UserAsset" ("userId","assetDefId","assetType","assetId",count) '
-                        "VALUES (?,?,?,?,?)",
-                        user["id"],
-                        PAID_CURRENCY_ASSET_ID,
-                        CURRENCY_ASSET_TYPE,
-                        asset["id"],
-                        amount_cents,
-                    )
-                    changed = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', created.lastrowid))
-                    await self.log_asset_change(conn, changed, 0, "CREATE", comment)
-                final_wallet = await self.wallet(uid, False, conn)
-                return {
-                    "originalBalance": wallet["total"]["available"],
-                    "finalBalance": final_wallet["total"]["available"],
-                    "amount": amount_cents,
-                    "changedRows": [changed],
-                }
+                return await self.wallets.add_paid_currency(uid, amount_cents, comment, conn)
 
     async def add_points(
         self,
@@ -737,84 +612,22 @@ class ShinjukuService:
         comment: str = "游玩积分",
         conn: DBConn | None = None,
     ) -> dict[str, Any]:
-        owns_conn = conn is None
-        if owns_conn:
+        if conn is None:
             async with self._acquire() as acquired:
                 async with acquired.transaction(immediate=True):
                     return await self.add_points(uid, amount, comment, acquired)
-
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        amount = max(0, int(amount))
-        if amount == 0:
-            return {"changedRows": [], "amount": 0}
-        asset = await self.ensure_points_asset(conn)
-        existing = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetId"=? AND "assetDefId"=? '
-                'AND "assetType"=? AND "activeAt" IS NULL AND "expireAt" IS NULL LIMIT 1',
-                user["id"],
-                asset["id"],
-                POINTS_ASSET_ID,
-                POINTS_ASSET_TYPE,
-            )
-        )
-        if existing:
-            await conn.execute('UPDATE "UserAsset" SET count=count+? WHERE id=?', amount, existing["id"])
-            updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
-            await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
-            changed = updated
-        else:
-            created = await conn.execute(
-                'INSERT INTO "UserAsset" ("userId","assetDefId","assetType","assetId",count) VALUES (?,?,?,?,?)',
-                user["id"],
-                POINTS_ASSET_ID,
-                POINTS_ASSET_TYPE,
-                asset["id"],
-                amount,
-            )
-            changed = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', created.lastrowid))
-            await self.log_asset_change(conn, changed, 0, "CREATE", comment)
-        return {"changedRows": [changed], "amount": amount}
+        return await self.wallets.add_points(uid, amount, comment, conn)
 
     async def charge_wallet(self, uid: str, amount_cents: int, comment: str = "admin charge") -> dict[str, Any]:
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                user = await self.find_user(uid, conn)
-                if not user:
-                    raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-                amount_cents = int(amount_cents)
-                if amount_cents <= 0:
-                    raise ShinjukuError("扣费金额必须大于 0。", "INVALID_AMOUNT")
-                wallet = await self.wallet(uid, False, conn)
-                await self.deduct_wallet(uid, amount_cents, comment, conn)
-                final_wallet = await self.wallet(uid, False, conn)
-                return {
-                    "originalBalance": wallet["total"]["available"],
-                    "finalBalance": final_wallet["total"]["available"],
-                    "amount": amount_cents,
-                }
+                return await self.wallets.charge_wallet(uid, amount_cents, comment, conn)
 
     async def add_pass(self, uid: str, days: int = 30, comment: str = "admin member") -> dict[str, Any]:
         """为用户发放通行证，与已有通行证自动续期叠加。"""
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                user = await self.find_user(uid, conn)
-                if not user:
-                    raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-                if int(days) <= 0:
-                    raise ShinjukuError("通行证天数必须大于 0。", "INVALID_DAYS")
-                asset = await self.ensure_pass_asset(conn)
-                duration_ms = int(days) * 86400000
-                return await self.add_asset_by_def(
-                    user["id"],
-                    asset,
-                    1,
-                    comment,
-                    conn,
-                    {"durationMs": duration_ms, "mergeStrategy": "EXTEND_TIME"},
-                )
+                return await self.wallets.add_pass(uid, days, comment, conn)
 
     async def _ensure_asset_definition(
         self,
@@ -825,167 +638,38 @@ class ShinjukuService:
         description: str,
         billing_effect: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        await conn.execute(
-            'INSERT OR IGNORE INTO "Asset" '
-            '("assetId",type,name,description,"billingEffect",valid) VALUES (?,?,?,?,?,1)',
+        return await self.assets.ensure_asset_definition(
+            conn,
             asset_id,
             asset_type,
             name,
             description,
-            json.dumps(billing_effect) if billing_effect is not None else None,
+            billing_effect,
         )
-        asset = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "Asset" WHERE type=? AND "assetId"=? LIMIT 1',
-                asset_type,
-                asset_id,
-            )
-        )
-        if not asset:
-            raise ShinjukuError("资产定义创建失败。", "ASSET_DEFINITION_CREATE_FAILED")
-        return asset
 
     async def ensure_currency_asset(self, conn: DBConn) -> dict[str, Any]:
-        return await self._ensure_asset_definition(
-            conn,
-            PAID_CURRENCY_ASSET_ID,
-            CURRENCY_ASSET_TYPE,
-            self.currency,
-            "AstrBot 插件自动创建的付费货币资产定义",
-        )
+        return await self.assets.ensure_currency_asset(conn)
 
     async def ensure_points_asset(self, conn: DBConn) -> dict[str, Any]:
-        return await self._ensure_asset_definition(
-            conn,
-            POINTS_ASSET_ID,
-            POINTS_ASSET_TYPE,
-            "积分",
-            "新宿插件自动创建的积分资产定义",
-        )
+        return await self.assets.ensure_points_asset(conn)
 
     async def ensure_pass_asset(self, conn: DBConn) -> dict[str, Any]:
-        return await self._ensure_asset_definition(
-            conn,
-            MONTHLY_PASS_ASSET_ID,
-            PASS_ASSET_TYPE,
-            "通行证",
-            "新宿插件自动创建的通行证资产定义",
-        )
+        return await self.assets.ensure_pass_asset(conn)
 
     async def grant_coupon(self, uid: str, discount_tenths: Any, days: int = 30, comment: str = "admin coupon") -> dict[str, Any]:
         """发放优惠券：discount_tenths 为 0-10 折（8 表示 8 折，付 80%），默认有效期 30 天。"""
         async with self._acquire() as conn:
             async with conn.transaction(immediate=True):
-                user = await self.find_user(uid, conn)
-                if not user:
-                    raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-                rate_bps = _discount_tenths_to_bps(discount_tenths)
-                if int(days) <= 0:
-                    raise ShinjukuError("优惠券有效天数必须大于 0。", "INVALID_DAYS")
-                asset = await self.ensure_coupon_asset(conn, rate_bps)
-                duration_ms = int(days) * 86400000
-                user_asset = await self.add_asset_by_def(
-                    user["id"],
-                    asset,
-                    1,
-                    comment,
-                    conn,
-                    {"durationMs": duration_ms, "mergeStrategy": "EXTEND_TIME"},
-                )
-                return {
-                    "user": user,
-                    "asset": asset,
-                    "userAsset": user_asset,
-                    "discount_tenths": _discount_tenths_text(rate_bps),
-                    "days": int(days),
-                }
+                return await self.wallets.grant_coupon(uid, discount_tenths, days, comment, conn)
 
     async def ensure_coupon_asset(self, conn: DBConn, rate_bps: int) -> dict[str, Any]:
-        rate_bps = int(rate_bps)
-        def_id = 200000 + rate_bps
-        tenths_text = _discount_tenths_text(rate_bps)
-        name = "免费券" if rate_bps == 0 else f"{tenths_text}折优惠券"
-        return await self._ensure_asset_definition(
-            conn,
-            def_id,
-            TICKET_ASSET_TYPE,
-            name,
-            f"管理员发放的{name}",
-            {
-                "type": "RATE",
-                "rateBps": rate_bps,
-                "priority": 50,
-                "stackable": False,
-                "consume": True,
-                "condition": {},
-            },
-        )
+        return await self.assets.ensure_coupon_asset(conn, rate_bps)
 
     async def deduct_wallet(self, uid: str, amount_cents: int, comment: str, conn: DBConn) -> None:
-        wallet = await self.wallet(uid, True, conn)
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        remaining = int(amount_cents)
-        candidates = [
-            asset
-            for asset in wallet["free"]["details"]["available"] + wallet["paid"]["details"]["available"]
-            if int(asset["count"]) > 0
-        ]
-        for asset in candidates:
-            if remaining <= 0:
-                break
-            deduct = min(int(asset["count"]), remaining)
-            new_count = int(asset["count"]) - deduct
-            if new_count <= 0:
-                await conn.execute('DELETE FROM "UserAsset" WHERE id=?', asset["id"])
-                changed = dict(asset)
-                changed["count"] = 0
-                await self.log_asset_change(conn, changed, asset["count"], "DELETE", comment)
-            else:
-                await conn.execute('UPDATE "UserAsset" SET count=? WHERE id=?', new_count, asset["id"])
-                updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', asset["id"]))
-                await self.log_asset_change(conn, updated, asset["count"], "UPDATE", comment)
-            remaining -= deduct
-        if remaining > 0:
-            # 余额不足：差额记为负数余额（欠费），挂在付费货币上，充值会自动抵扣
-            currency_asset = await self.ensure_currency_asset(conn)
-            existing = _row(
-                await conn.fetchrow(
-                    'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetId"=? AND "assetDefId"=? AND "assetType"=? '
-                    'AND "activeAt" IS NULL AND "expireAt" IS NULL LIMIT 1',
-                    user["id"],
-                    currency_asset["id"],
-                    PAID_CURRENCY_ASSET_ID,
-                    CURRENCY_ASSET_TYPE,
-                )
-            )
-            if existing:
-                new_count = int(existing["count"]) - remaining
-                await conn.execute('UPDATE "UserAsset" SET count=? WHERE id=?', new_count, existing["id"])
-                updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
-                await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
-            else:
-                created = await conn.execute(
-                    'INSERT INTO "UserAsset" ("userId","assetDefId","assetType","assetId",count) VALUES (?,?,?,?,?)',
-                    user["id"],
-                    PAID_CURRENCY_ASSET_ID,
-                    CURRENCY_ASSET_TYPE,
-                    currency_asset["id"],
-                    -remaining,
-                )
-                created = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', created.lastrowid))
-                await self.log_asset_change(conn, created, 0, "CREATE", comment)
+        await self.wallets.deduct_wallet(uid, amount_cents, comment, conn)
 
     async def delete_user_assets(self, uid: str, ids: list[int], conn: DBConn) -> None:
-        if not ids:
-            return
-        assets = [asset for asset in await self.user_assets(uid, False, conn) if asset["id"] in ids]
-        for asset in assets:
-            await conn.execute('DELETE FROM "UserAsset" WHERE id=?', asset["id"])
-            changed = dict(asset)
-            changed["count"] = 0
-            await self.log_asset_change(conn, changed, asset["count"], "DELETE", "deleteUserAssets Function")
+        await self.assets.delete_user_assets(uid, ids, conn)
 
     async def log_asset_change(
         self,
@@ -995,21 +679,7 @@ class ShinjukuService:
         action: str,
         comment: str,
     ) -> None:
-        await conn.execute(
-            'INSERT INTO "UserAssetLog" ("userId","userAssetId","assetId","assetType","changeAmount","countBefore","countAfter","expireAtBefore","expireAtAfter",action,comment) '
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            asset["userId"],
-            asset.get("id"),
-            asset["assetDefId"],
-            asset["assetType"],
-            int(asset["count"]) - int(original_count),
-            int(original_count),
-            int(asset["count"]),
-            None,
-            asset.get("expireAt"),
-            action,
-            comment,
-        )
+        await self.assets.log_asset_change(conn, asset, original_count, action, comment)
 
     async def upsert_present_by_id(self, uid: str | int, present_id: int, conn: DBConn | None = None) -> Any:
         owns_conn = conn is None
@@ -1179,20 +849,7 @@ class ShinjukuService:
         return changes
 
     async def _ensure_standard_asset(self, conn: DBConn, asset_id: int, asset_type: str) -> dict[str, Any] | None:
-        """为已知的标准资产（付费/免费货币、通行证）补建资产定义，避免礼包发放时被跳过。"""
-        if asset_type == CURRENCY_ASSET_TYPE and asset_id == PAID_CURRENCY_ASSET_ID:
-            return await self.ensure_currency_asset(conn)
-        if asset_type == CURRENCY_ASSET_TYPE and asset_id == FREE_CURRENCY_ASSET_ID:
-            return await self._ensure_asset_definition(
-                conn,
-                FREE_CURRENCY_ASSET_ID,
-                CURRENCY_ASSET_TYPE,
-                f"{self.currency}（免费）",
-                "新宿插件自动创建的免费货币资产定义",
-            )
-        if asset_type == PASS_ASSET_TYPE and asset_id == MONTHLY_PASS_ASSET_ID:
-            return await self.ensure_pass_asset(conn)
-        return None
+        return await self.assets.ensure_standard_asset(conn, asset_id, asset_type)
 
     async def add_asset_by_def(
         self,
@@ -1203,71 +860,4 @@ class ShinjukuService:
         conn: DBConn,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        user = await self.find_user(uid, conn)
-        if not user:
-            raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        options = options or {}
-        amount = int(amount)
-        active_at = _as_dt(options.get("activeAt"))
-        expire_at = _as_dt(options.get("expireAt")) or _future_dt(options.get("durationMs"))
-        merge_strategy = str(options.get("mergeStrategy") or "STACK").upper()
-        if merge_strategy == "EXTEND_TIME":
-            duration_expire_at = _future_dt(options.get("durationMs"))
-            if not duration_expire_at:
-                raise ShinjukuError("EXTEND_TIME 策略必须提供正数 durationMs。", "INVALID_DURATION_MS")
-            existing = _row(
-                await conn.fetchrow(
-                    'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetId"=? AND "assetDefId"=? AND "assetType"=? '
-                    'ORDER BY "expireAt" DESC LIMIT 1',
-                    user["id"],
-                    asset["id"],
-                    asset["assetId"],
-                    asset["type"],
-                )
-            )
-            if existing and existing["count"] > 0:
-                base_time = existing.get("expireAt") if existing.get("expireAt") and existing["expireAt"] > _now() else _now()
-                duration_ms = float(options["durationMs"])
-                new_expire_at = base_time + timedelta(milliseconds=duration_ms)
-                await conn.execute(
-                    'UPDATE "UserAsset" SET count=1, "activeAt"=COALESCE("activeAt", ?), "expireAt"=? WHERE id=?',
-                    _now(),
-                    new_expire_at,
-                    existing["id"],
-                )
-                updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
-                await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
-                return updated
-            active_at = active_at or _now()
-            expire_at = duration_expire_at
-        existing = _row(
-            await conn.fetchrow(
-                'SELECT * FROM "UserAsset" WHERE "userId"=? AND "assetId"=? AND "assetDefId"=? AND "assetType"=? '
-                'AND "activeAt" IS ? AND "expireAt" IS ? LIMIT 1',
-                user["id"],
-                asset["id"],
-                asset["assetId"],
-                asset["type"],
-                active_at,
-                expire_at,
-            )
-        )
-        if existing:
-            await conn.execute('UPDATE "UserAsset" SET count=count+? WHERE id=?', amount, existing["id"])
-            updated = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', existing["id"]))
-            await self.log_asset_change(conn, updated, existing["count"], "UPDATE", comment)
-            return updated
-        created = await conn.execute(
-            'INSERT INTO "UserAsset" ("userId","assetDefId","assetType","assetId",count,"activeAt","expireAt") '
-            "VALUES (?,?,?,?,?,?,?)",
-            user["id"],
-            asset["assetId"],
-            asset["type"],
-            asset["id"],
-            amount,
-            active_at,
-            expire_at,
-        )
-        created = _row(await conn.fetchrow('SELECT * FROM "UserAsset" WHERE id=?', created.lastrowid))
-        await self.log_asset_change(conn, created, 0, "CREATE", comment)
-        return created
+        return await self.assets.add_asset_by_def(uid, asset, amount, comment, conn, options)
