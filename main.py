@@ -386,7 +386,7 @@ class ShinjukuPlugin(Star):
             uid = f"QQ:{at_ids[0]}" if at_ids else self._normalize_user(args[0], event, allow_self=False)
             self._at_label(event, uid)
             limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
-            sessions = await self.service.history(uid, limit)
+            sessions = await self.service.history(uid, limit, include_cancelled=True)
             return format_history(sessions, self.currency)
 
         yield event.plain_result(await self._safe(run()))

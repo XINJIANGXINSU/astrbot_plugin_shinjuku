@@ -8,7 +8,13 @@ from typing import Any, Callable
 try:
     from .asset_service import AssetService
     from ..core.billing_engine import BillingEngine
-    from ..core.constants import MONTHLY_PASS_ASSET_ID, PASS_ASSET_TYPE
+    from ..core.constants import (
+        MONTHLY_PASS_ASSET_ID,
+        PASS_ASSET_TYPE,
+        SESSION_CLOSE_GRACE_CANCELLED,
+        SESSION_CLOSE_LOGIN_GRACE_CANCELLED,
+        SESSION_CLOSE_SETTLED,
+    )
     from ..core.errors import ShinjukuError
     from ..core.money import MONEY_SCALE, RATE_SCALE, amount_to_cents, discounted_cents
     from ..infrastructure.storage import DBConn, row_to_dict
@@ -17,7 +23,13 @@ try:
 except ImportError:  # pragma: no cover - standalone test/import compatibility
     from services.asset_service import AssetService
     from core.billing_engine import BillingEngine
-    from core.constants import MONTHLY_PASS_ASSET_ID, PASS_ASSET_TYPE
+    from core.constants import (
+        MONTHLY_PASS_ASSET_ID,
+        PASS_ASSET_TYPE,
+        SESSION_CLOSE_GRACE_CANCELLED,
+        SESSION_CLOSE_LOGIN_GRACE_CANCELLED,
+        SESSION_CLOSE_SETTLED,
+    )
     from core.errors import ShinjukuError
     from core.money import MONEY_SCALE, RATE_SCALE, amount_to_cents, discounted_cents
     from infrastructure.storage import DBConn, row_to_dict
@@ -75,8 +87,9 @@ class BillingService:
             wallet_before = await self.wallets.wallet(uid, conn)
             await conn.execute(
                 'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, '
-                '"billingCost"=0, "finalCost"=0 WHERE id=?',
+                '"billingCost"=0, "finalCost"=0, "closeReason"=? WHERE id=?',
                 now,
+                SESSION_CLOSE_LOGIN_GRACE_CANCELLED,
                 session_before["id"],
             )
             closed = row_to_dict(
@@ -136,12 +149,25 @@ class BillingService:
             )
             preview["pointsEarned"] = points_earned
         closed_at = self.now()
+        grace_minutes = max(0, int(self.billing_config.get("grace_minutes") or 0))
+        within_standard_grace = (
+            not door_opened
+            and played_seconds < 3600
+            and played_seconds // 60 <= grace_minutes
+            and int(billing["totalCost"]) == 0
+        )
+        close_reason = (
+            SESSION_CLOSE_GRACE_CANCELLED
+            if within_standard_grace
+            else SESSION_CLOSE_SETTLED
+        )
         await conn.execute(
             'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, '
-            '"billingCost"=?, "finalCost"=? WHERE id=?',
+            '"billingCost"=?, "finalCost"=?, "closeReason"=? WHERE id=?',
             closed_at,
             billing["totalCost"],
             cost,
+            close_reason,
             session["id"],
         )
         closed = row_to_dict(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', session["id"]))

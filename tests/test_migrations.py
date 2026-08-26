@@ -23,6 +23,11 @@ def test_legacy_session_columns_are_added_explicitly(tmp_path):
             "finalCost" INTEGER
         )'''
     )
+    raw.execute(
+        'INSERT INTO "Session" '
+        '(id,"userId","createdAt","closedAt","isActive","billingCost","finalCost") '
+        'VALUES (1,1,"2026-08-01T12:00:00","2026-08-01T13:00:00",NULL,0,0)'
+    )
     raw.commit()
     raw.close()
 
@@ -41,10 +46,19 @@ def test_legacy_session_columns_are_added_explicitly(tmp_path):
         migration_keys = {
             row[0] for row in raw.execute('SELECT key FROM "SchemaMigration"')
         }
+        close_reason = raw.execute(
+            'SELECT "closeReason" FROM "Session" WHERE id=1'
+        ).fetchone()[0]
+        history_index = raw.execute(
+            'SELECT sql FROM sqlite_master '
+            'WHERE type="index" AND name="idx_session_user_history"'
+        ).fetchone()[0]
     finally:
         raw.close()
 
-    assert {"CHECKCODE", "doorOpened", "ENTRY_TYPE"} <= columns
+    assert {"CHECKCODE", "doorOpened", "ENTRY_TYPE", "closeReason"} <= columns
+    assert close_reason is None
+    assert '"userId", "createdAt" DESC' in history_index
     assert {
         MONEY_MIGRATION_KEY,
         IDENTITY_CONSTRAINTS_MIGRATION_KEY,

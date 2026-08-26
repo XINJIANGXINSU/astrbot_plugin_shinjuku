@@ -70,12 +70,17 @@ class DatabaseMigrator:
                 'ALTER TABLE "Session" ADD COLUMN "ENTRY_TYPE" '
                 "TEXT NOT NULL DEFAULT 'normal'"
             ),
+            "closeReason": 'ALTER TABLE "Session" ADD COLUMN "closeReason" TEXT',
         }
         for column, statement in additions.items():
             if column not in columns:
                 await raw.execute(statement)
         await raw.execute(
             'CREATE INDEX IF NOT EXISTS idx_session_checkcode ON "Session"("CHECKCODE")'
+        )
+        await raw.execute(
+            'CREATE INDEX IF NOT EXISTS idx_session_user_history '
+            'ON "Session"("userId", "createdAt" DESC)'
         )
         await raw.commit()
 
