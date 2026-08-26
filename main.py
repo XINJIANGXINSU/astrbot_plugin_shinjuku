@@ -308,16 +308,19 @@ class ShinjukuPlugin(Star):
 
     @filter.regex(r"^/?死给(?:\s|@|$)")
     async def force_logout_cmd(self, event: AstrMessageEvent):
-        """管理员强制退场（忽略结算）：死给 @某人；未 @ 人时不响应"""
+        """管理员强制退场（忽略结算）：死给 @用户 或 死给 QQ号。"""
         if not self._is_admin(event):
             event.stop_event()
             return
+        args = self._args(event)
         at_ids = self._at_ids(event)
-        if not at_ids:
+        if at_ids:
+            uid = f"QQ:{at_ids[0]}"
+        elif args:
+            uid = self._normalize_user(args[0], event, allow_self=False)
+        else:
             event.stop_event()
             return
-
-        uid = f"QQ:{at_ids[0]}"
 
         async def run():
             result = await self.service.force_logout(uid)
