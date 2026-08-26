@@ -8,12 +8,20 @@ from datetime import datetime
 from typing import Any, Callable
 
 try:
+    from ..core.constants import (
+        CANCELLED_SESSION_CLOSE_REASONS,
+        SESSION_CLOSE_FORCE_CLOSED,
+    )
     from ..core.errors import ShinjukuError
     from ..core.money import cents_to_text
     from ..infrastructure.storage import DBConn, row_to_dict, rows_to_dicts
     from .user_service import UserService
     from .wallet_service import WalletService
 except ImportError:  # pragma: no cover - standalone test/import compatibility
+    from core.constants import (
+        CANCELLED_SESSION_CLOSE_REASONS,
+        SESSION_CLOSE_FORCE_CLOSED,
+    )
     from core.errors import ShinjukuError
     from core.money import cents_to_text
     from infrastructure.storage import DBConn, row_to_dict, rows_to_dicts
@@ -148,23 +156,41 @@ class SessionService:
         if not session:
             raise ShinjukuError("用户未登录。", "USER_NOT_LOGGED_IN")
         await conn.execute(
-            'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, "billingCost"=0, "finalCost"=0 WHERE id=?',
+            'UPDATE "Session" SET "closedAt"=?, "isActive"=NULL, '
+            '"billingCost"=0, "finalCost"=0, "closeReason"=? WHERE id=?',
             self.now(),
+            SESSION_CLOSE_FORCE_CLOSED,
             session["id"],
         )
         closed = row_to_dict(await conn.fetchrow('SELECT * FROM "Session" WHERE id=?', session["id"]))
         return {"session": closed}
 
-    async def history(self, uid: str | int, limit: int, conn: DBConn) -> list[dict[str, Any]]:
+    async def history(
+        self,
+        uid: str | int,
+        limit: int,
+        conn: DBConn,
+        include_cancelled: bool = False,
+    ) -> list[dict[str, Any]]:
         user = await self.users.find_user(uid, conn)
         if not user:
             raise ShinjukuError("用户不存在。", "USER_NOT_FOUND")
-        return rows_to_dicts(
-            await conn.fetch(
-                'SELECT * FROM "Session" WHERE "userId"=? ORDER BY "createdAt" DESC LIMIT ?',
-                user["id"],
-                limit,
+        if include_cancelled:
+            sql = (
+                'SELECT * FROM "Session" WHERE "userId"=? '
+                'ORDER BY "createdAt" DESC LIMIT ?'
             )
+            params = (user["id"], limit)
+        else:
+            placeholders = ",".join("?" for _ in CANCELLED_SESSION_CLOSE_REASONS)
+            sql = (
+                'SELECT * FROM "Session" WHERE "userId"=? '
+                f'AND ("closeReason" IS NULL OR "closeReason" NOT IN ({placeholders})) '
+                'ORDER BY "createdAt" DESC LIMIT ?'
+            )
+            params = (user["id"], *CANCELLED_SESSION_CLOSE_REASONS, limit)
+        return rows_to_dicts(
+            await conn.fetch(sql, *params)
         )
 
     async def is_sneak_active(self, uid: str | int, conn: DBConn) -> bool:

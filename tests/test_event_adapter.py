@@ -58,3 +58,11 @@ def test_event_adapter_reads_at_target_and_label():
 
     assert adapter.at_ids(event) == ["54321"]
     assert adapter.at_label(event, "QQ:54321") == "Bob (54321)"
+
+
+def test_event_adapter_parses_force_logout_with_direct_qq():
+    adapter = EventAdapter(NicknameCache())
+    event = FakeEvent("/死给 54321")
+
+    assert adapter.args(event) == ["54321"]
+    assert adapter.normalize_user(adapter.args(event)[0], event, False) == "QQ:54321"

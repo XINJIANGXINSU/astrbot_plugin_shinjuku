@@ -116,6 +116,26 @@ def test_history_presenter_contract():
     assert format_history([], "馕") == "暂无历史记录。"
 
 
+def test_history_presenter_labels_session_close_reason():
+    sessions = [
+        {
+            "id": 10,
+            "createdAt": START,
+            "closedAt": END,
+            "finalCost": 0,
+            "isActive": None,
+            "ENTRY_TYPE": "normal",
+            "closeReason": "FORCE_CLOSED",
+        }
+    ]
+
+    assert format_history(sessions, "馕") == (
+        "--- 历史记录 ---\n"
+        "[10] 已结束（管理员强制退场）｜2026/08/25 11:30:00 -> "
+        "2026/08/25 12:30:00｜0 馕"
+    )
+
+
 def test_presence_presenter_contract_masks_sneak_players():
     users = [
         {

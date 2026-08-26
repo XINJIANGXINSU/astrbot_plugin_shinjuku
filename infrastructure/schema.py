@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS "Session" (
     "isActive" INTEGER,
     "billingCost" INTEGER,
     "finalCost" INTEGER,
+    "closeReason" TEXT,
     "CHECKCODE" TEXT,
     "doorOpened" INTEGER NOT NULL DEFAULT 0,
     "ENTRY_TYPE" TEXT NOT NULL DEFAULT 'normal'

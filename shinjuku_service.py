@@ -243,9 +243,14 @@ class ShinjukuService:
     def _best_coupon(wallet: dict[str, Any]) -> dict[str, Any] | None:
         return BillingService.best_coupon(wallet)
 
-    async def history(self, uid: str, limit: int = 5) -> list[dict[str, Any]]:
+    async def history(
+        self,
+        uid: str,
+        limit: int = 5,
+        include_cancelled: bool = False,
+    ) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
-            return await self.sessions.history(uid, limit, conn)
+            return await self.sessions.history(uid, limit, conn, include_cancelled)
 
     async def active_session(self, uid: str, conn: DBConn) -> dict[str, Any] | None:
         return await self.sessions.active_session(uid, conn)

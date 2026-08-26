@@ -30,7 +30,7 @@ from .presentation import (
 from .shinjuku_service import ShinjukuService
 
 
-@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.4.0")
+@register("astrbot_plugin_shinjuku", "li", "新宿 上机计费插件", "0.4.1")
 class ShinjukuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -308,16 +308,19 @@ class ShinjukuPlugin(Star):
 
     @filter.regex(r"^/?死给(?:\s|@|$)")
     async def force_logout_cmd(self, event: AstrMessageEvent):
-        """管理员强制退场（忽略结算）：死给 @某人；未 @ 人时不响应"""
+        """管理员强制退场（忽略结算）：死给 @用户 或 死给 QQ号。"""
         if not self._is_admin(event):
             event.stop_event()
             return
+        args = self._args(event)
         at_ids = self._at_ids(event)
-        if not at_ids:
+        if at_ids:
+            uid = f"QQ:{at_ids[0]}"
+        elif args:
+            uid = self._normalize_user(args[0], event, allow_self=False)
+        else:
             event.stop_event()
             return
-
-        uid = f"QQ:{at_ids[0]}"
 
         async def run():
             result = await self.service.force_logout(uid)
@@ -386,7 +389,7 @@ class ShinjukuPlugin(Star):
             uid = f"QQ:{at_ids[0]}" if at_ids else self._normalize_user(args[0], event, allow_self=False)
             self._at_label(event, uid)
             limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
-            sessions = await self.service.history(uid, limit)
+            sessions = await self.service.history(uid, limit, include_cancelled=True)
             return format_history(sessions, self.currency)
 
         yield event.plain_result(await self._safe(run()))
