@@ -1,7 +1,11 @@
 name: astrbot_plugin_shinjuku
-display_name: 新宿
-desc: AstrBot 原生「新宿」上机计费插件，使用 SQLite 本地存储，首次运行自动建表。
+display_name: 新宿音游社
+short_desc: 音游窝计费插件
+desc: AstrBot 原生「新宿」音游窝上机计费插件，使用 SQLite 本地存储。
 version: v0.4.1
-author: li
+author: KENK杀戳
 repo: https://github.com/XINJIANGXINSU/astrbot_plugin_shinjuku
 astrbot_version: ">=4.16"
+support_platforms: aiocqhttp
+social_link: https://github.com/KENKshachu0
+tags: 音游
