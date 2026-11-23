@@ -208,6 +208,8 @@ class BillingService:
         overnight_caps: list[dict[str, Any]] = []
         total_cost = 0
         total_points = 0
+        # points_per_amount 为 0 表示关闭游玩积分：小时积分与封顶折算都不再发放。
+        points_enabled = self.points_per_amount > 0
         current = session["createdAt"]
         while current < calculation_end:
             block_end = min(current + timedelta(days=1), calculation_end)
@@ -225,19 +227,22 @@ class BillingService:
                 overnight_cap = dict(overnight_cap)
                 overnight_cap["blockIndex"] = len(blocks)
                 overnight_caps.append(overnight_cap)
+            block_points = 0
             if cap24 > 0 and block["totalCost"] > cap24:
-                total_points += self.cap_points(cap24)
+                block_points += self.cap_points(cap24)
             else:
                 if overnight_cap:
-                    total_points += self.cap_points(night_cap)
+                    block_points += self.cap_points(night_cap)
                 for segment in block["segments"]:
                     if segment.get("overnightCapCovered"):
                         continue
                     if segment["isCapped"]:
                         cap = day_cap if segment["ruleId"] == 1 else night_cap
-                        total_points += self.cap_points(cap)
+                        block_points += self.cap_points(cap)
                     else:
-                        total_points += segment["durationMinutes"] // 60
+                        block_points += segment["durationMinutes"] // 60
+            if points_enabled:
+                total_points += block_points
             if cap24 > 0:
                 for segment in block["segments"]:
                     segment["blockIndex"] = len(blocks)
